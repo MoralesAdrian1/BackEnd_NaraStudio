@@ -1,0 +1,640 @@
+// Esquema de la base de datos de Nara Studio.
+// Después de cambiarlo: `npm run db:migrate` (desarrollo) o `npm run db:deploy` (producción).
+//
+// Convenciones:
+// - Tablas y columnas en snake_case (@@map / @map); modelos y campos en Prisma en camelCase.
+// - Dinero en centavos (Int) y moneda MXN.
+// - Fechas con hora en timestamptz; el estudio vive en America/Mexico_City.
+// - Días de la semana como número: 0 = domingo … 6 = sábado.
+// - Lo que Prisma no expresa (FK a auth.users, CHECKs, RLS) va en SQL dentro de la migración.
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ──────────────────────────────────────────────────────────────────
+
+enum Role {
+  admin
+  coach
+  student
+
+  @@map("role")
+}
+
+enum SessionStatus {
+  scheduled
+  cancelled
+  completed
+
+  @@map("session_status")
+}
+
+enum PlanKind {
+  monthly
+  weekly
+  pack
+  single_class
+
+  @@map("plan_kind")
+}
+
+enum MembershipStatus {
+  pending_payment // efectivo: se paga el día de la clase (vence en request_expires_at)
+  active
+  expired
+  cancelled
+
+  @@map("membership_status")
+}
+
+enum BookingStatus {
+  booked
+  attended
+  no_show
+  cancelled_by_student
+  cancelled_by_studio
+
+  @@map("booking_status")
+}
+
+enum PaymentMethod {
+  card
+  cash
+
+  @@map("payment_method")
+}
+
+enum PaymentStatus {
+  pending
+  succeeded
+  failed
+  refunded
+  partially_refunded
+
+  @@map("payment_status")
+}
+
+enum AllocationKind {
+  sale
+  refund
+
+  @@map("allocation_kind")
+}
+
+enum PayoutStatus {
+  in_transit
+  paid
+  failed
+  canceled
+
+  @@map("payout_status")
+}
+
+enum SettlementPeriodStatus {
+  open
+  closed
+
+  @@map("settlement_period_status")
+}
+
+enum SettlementMethod {
+  cash
+  transfer
+
+  @@map("settlement_method")
+}
+
+enum LegalDocumentKind {
+  terms
+  privacy
+
+  @@map("legal_document_kind")
+}
+
+// ─── Personas ───────────────────────────────────────────────────────────────
+
+/// Una fila por cuenta de Supabase Auth (id = auth.users.id).
+model Profile {
+  id        String    @id @db.Uuid
+  role      Role
+  fullName  String    @map("full_name")
+  email     String    @unique
+  phone     String?
+  birthDate DateTime? @map("birth_date") @db.Date
+  isActive  Boolean   @default(true) @map("is_active")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  student Student?
+  coach   Coach?
+
+  @@map("profiles")
+}
+
+/// Alumna. Las que registra una coach reciben una invitación y tienen cuenta desde el inicio;
+/// sin profile_id = registro anterior que todavía no tiene cuenta.
+model Student {
+  id               Int       @id @default(autoincrement())
+  profileId        String?   @unique @map("profile_id") @db.Uuid
+  fullName         String    @map("full_name")
+  publicName       String?   @map("public_name") // nombre en la tabla de reconocimientos
+  email            String?
+  phone            String?
+  address          String?
+  birthDate        DateTime? @map("birth_date") @db.Date
+  photoPath        String?   @map("photo_path") // ruta en Supabase Storage (bucket students)
+  stripeCustomerId String?   @unique @map("stripe_customer_id")
+  registeredById   Int?      @map("registered_by_id")
+  isActive         Boolean   @default(true) @map("is_active")
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  profile          Profile?           @relation(fields: [profileId], references: [id], onDelete: SetNull)
+  registeredBy     Coach?             @relation("StudentRegisteredBy", fields: [registeredById], references: [id], onDelete: SetNull)
+  health           StudentHealth?
+  memberships      Membership[]
+  bookings         Booking[]
+  payments         Payment[]
+  streak           StudentStreak?
+  leaderboard      LeaderboardEntry[]
+  legalAcceptances LegalAcceptance[]
+
+  @@index([registeredById])
+  @@map("students")
+}
+
+/// Datos sensibles (LFPDPPP): solo los ven la alumna y sus coaches.
+model StudentHealth {
+  studentId         Int       @id @map("student_id")
+  weightKg          Decimal?  @map("weight_kg") @db.Decimal(5, 2)
+  heightCm          Int?      @map("height_cm") @db.SmallInt
+  specialConditions String?   @map("special_conditions") // lesiones, alergias, etc.
+  consentAt         DateTime? @map("consent_at") @db.Timestamptz
+  updatedAt         DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@map("student_health")
+}
+
+model Coach {
+  id        Int      @id @default(autoincrement())
+  profileId String   @unique @map("profile_id") @db.Uuid
+  bio       String?
+  instagram String?
+  tiktok    String?
+  photoPath String?  @map("photo_path") // ruta en Supabase Storage
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  profile             Profile              @relation(fields: [profileId], references: [id], onDelete: Restrict)
+  disciplines         CoachDiscipline[]
+  certifications      CoachCertification[]
+  classes             StudioClass[]
+  sessions            ClassSession[]
+  plansCreated        Plan[]
+  revenueShares       PlanRevenueShare[]
+  allocations         PaymentAllocation[]
+  studentsRegistered  Student[]            @relation("StudentRegisteredBy")
+  cashReceived        Payment[]            @relation("PaymentReceivedBy")
+  membershipsApproved Membership[]         @relation("MembershipApprovedBy")
+  bookingsMarked      Booking[]            @relation("BookingMarkedBy")
+  settlementsSent     Settlement[]         @relation("SettlementFrom")
+  settlementsReceived Settlement[]         @relation("SettlementTo")
+
+  @@map("coaches")
+}
+
+model CoachDiscipline {
+  coachId      Int @map("coach_id")
+  disciplineId Int @map("discipline_id")
+
+  coach      Coach      @relation(fields: [coachId], references: [id], onDelete: Cascade)
+  discipline Discipline @relation(fields: [disciplineId], references: [id], onDelete: Restrict)
+
+  @@id([coachId, disciplineId])
+  @@index([disciplineId])
+  @@map("coach_disciplines")
+}
+
+model CoachCertification {
+  id        Int       @id @default(autoincrement())
+  coachId   Int       @map("coach_id")
+  name      String
+  issuer    String?
+  filePath  String?   @map("file_path") // PDF en Supabase Storage
+  issuedAt  DateTime? @map("issued_at") @db.Date
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  coach Coach @relation(fields: [coachId], references: [id], onDelete: Cascade)
+
+  @@index([coachId])
+  @@map("coach_certifications")
+}
+
+// ─── Catálogo y clases ──────────────────────────────────────────────────────
+
+model Discipline {
+  id              Int     @id @default(autoincrement())
+  name            String  @unique
+  slug            String  @unique
+  description     String?
+  defaultCapacity Int     @map("default_capacity") @db.SmallInt // 13 barre, 10 trampolín
+  isActive        Boolean @default(true) @map("is_active")
+
+  coaches       CoachDiscipline[]
+  classes       StudioClass[]
+  revenueShares PlanRevenueShare[]
+  allocations   PaymentAllocation[]
+
+  @@map("disciplines")
+}
+
+/// Tipo de clase: Barre & Sculpt, Barre Restore, Jump…
+model StudioClass {
+  id           Int      @id @default(autoincrement())
+  name         String
+  disciplineId Int      @map("discipline_id")
+  coachId      Int      @map("coach_id")
+  capacity     Int      @db.SmallInt
+  durationMin  Int      @default(60) @map("duration_min") @db.SmallInt
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  discipline Discipline      @relation(fields: [disciplineId], references: [id], onDelete: Restrict)
+  coach      Coach           @relation(fields: [coachId], references: [id], onDelete: Restrict)
+  schedules  ClassSchedule[]
+  sessions   ClassSession[]
+
+  @@index([disciplineId])
+  @@index([coachId])
+  @@map("classes")
+}
+
+/// Horario recurrente: "todos los lunes a las 19:00".
+model ClassSchedule {
+  id         Int       @id @default(autoincrement())
+  classId    Int       @map("class_id")
+  weekday    Int       @db.SmallInt // 0 = domingo … 6 = sábado
+  startTime  DateTime  @map("start_time") @db.Time(0) // hora local del estudio
+  validFrom  DateTime  @map("valid_from") @db.Date
+  validUntil DateTime? @map("valid_until") @db.Date
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  class    StudioClass    @relation(fields: [classId], references: [id], onDelete: Restrict)
+  sessions ClassSession[]
+
+  @@index([classId])
+  @@map("class_schedules")
+}
+
+/// Una clase en una fecha y hora concretas. Se generan con dos semanas de adelanto.
+/// Sin schedule_id = clase abierta en un horario nuevo.
+model ClassSession {
+  id           Int           @id @default(autoincrement())
+  classId      Int           @map("class_id")
+  scheduleId   Int?          @map("schedule_id")
+  coachId      Int           @map("coach_id") // puede ser una suplente
+  startsAt     DateTime      @map("starts_at") @db.Timestamptz
+  endsAt       DateTime      @map("ends_at") @db.Timestamptz
+  capacity     Int           @db.SmallInt
+  status       SessionStatus @default(scheduled)
+  cancelReason String?       @map("cancel_reason")
+  cancelledAt  DateTime?     @map("cancelled_at") @db.Timestamptz
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz
+
+  class                  StudioClass    @relation(fields: [classId], references: [id], onDelete: Restrict)
+  schedule               ClassSchedule? @relation(fields: [scheduleId], references: [id], onDelete: SetNull)
+  coach                  Coach          @relation(fields: [coachId], references: [id], onDelete: Restrict)
+  bookings               Booking[]
+  singleClassMemberships Membership[]
+
+  @@unique([scheduleId, startsAt]) // generar sesiones dos veces no las duplica
+  @@index([startsAt])
+  @@index([classId])
+  @@index([coachId])
+  @@map("class_sessions")
+}
+
+/// Días sin clases (festivos). No se generan sesiones y la racha los perdona.
+model StudioClosure {
+  id        Int      @id @default(autoincrement())
+  date      DateTime @unique @db.Date
+  reason    String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@map("studio_closures")
+}
+
+// ─── Venta y uso ────────────────────────────────────────────────────────────
+
+/// Catálogo de membresías. Las reglas viven en los datos, no en el código.
+model Plan {
+  id              Int      @id @default(autoincrement())
+  name            String
+  description     String?
+  kind            PlanKind
+  priceCents      Int      @map("price_cents")
+  currency        String   @default("MXN") @db.Char(3)
+  credits         Int? // null = ilimitados
+  durationDays    Int      @map("duration_days") @db.SmallInt
+  trainingDays    Int[]    @map("training_days") // días que cuentan para la racha
+  allowsAutoRenew Boolean  @default(false) @map("allows_auto_renew") // solo mensuales
+  stripePriceId   String?  @map("stripe_price_id")
+  createdById     Int      @map("created_by_id")
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  createdBy     Coach              @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  revenueShares PlanRevenueShare[]
+  memberships   Membership[]
+
+  @@index([createdById])
+  @@map("plans")
+}
+
+/// A quién le corresponde el dinero del plan. Dos filas = plan combinado (lo crea el admin).
+model PlanRevenueShare {
+  id           Int @id @default(autoincrement())
+  planId       Int @map("plan_id")
+  disciplineId Int @map("discipline_id")
+  coachId      Int @map("coach_id")
+  basisPoints  Int @map("basis_points") // 10000 = 100 %, 5000 = 50 %
+
+  plan       Plan       @relation(fields: [planId], references: [id], onDelete: Cascade)
+  discipline Discipline @relation(fields: [disciplineId], references: [id], onDelete: Restrict)
+  coach      Coach      @relation(fields: [coachId], references: [id], onDelete: Restrict)
+
+  @@unique([planId, disciplineId])
+  @@index([disciplineId])
+  @@index([coachId])
+  @@map("plan_revenue_shares")
+}
+
+/// Lo que compró una alumna. Copia precio, créditos y días del plan al comprar.
+/// Créditos disponibles = credits_total − reservas en estado booked o attended.
+model Membership {
+  id                   Int              @id @default(autoincrement())
+  studentId            Int              @map("student_id")
+  planId               Int              @map("plan_id")
+  status               MembershipStatus @default(pending_payment)
+  creditsTotal         Int?             @map("credits_total") // null = ilimitados
+  pricePaidCents       Int              @map("price_paid_cents")
+  currency             String           @default("MXN") @db.Char(3)
+  trainingDays         Int[]            @map("training_days")
+  startsAt             DateTime?        @map("starts_at") @db.Timestamptz
+  expiresAt            DateTime?        @map("expires_at") @db.Timestamptz
+  classSessionId       Int?             @map("class_session_id") // solo clase individual
+  autoRenew            Boolean          @default(false) @map("auto_renew")
+  cancelAtPeriodEnd    Boolean          @default(false) @map("cancel_at_period_end")
+  stripeSubscriptionId String?          @map("stripe_subscription_id")
+  renewedFromId        Int?             @unique @map("renewed_from_id")
+  requestExpiresAt     DateTime?        @map("request_expires_at") @db.Timestamptz // efectivo: +3 días, o al terminar la clase reservada
+  approvedById         Int?             @map("approved_by_id")
+  approvedAt           DateTime?        @map("approved_at") @db.Timestamptz
+  createdAt            DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt            DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+
+  student      Student       @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  plan         Plan          @relation(fields: [planId], references: [id], onDelete: Restrict)
+  classSession ClassSession? @relation(fields: [classSessionId], references: [id], onDelete: Restrict)
+  approvedBy   Coach?        @relation("MembershipApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  renewedFrom  Membership?   @relation("MembershipRenewal", fields: [renewedFromId], references: [id], onDelete: SetNull)
+  renewedBy    Membership?   @relation("MembershipRenewal")
+  bookings     Booking[]
+  payments     Payment[]
+
+  @@index([studentId, status])
+  @@index([planId])
+  @@index([classSessionId])
+  @@index([stripeSubscriptionId])
+  @@index([status, requestExpiresAt])
+  @@map("memberships")
+}
+
+/// Reserva y asistencia en una sola fila. Si la alumna cancela y vuelve a reservar,
+/// se reutiliza la misma fila (una por alumna y sesión).
+model Booking {
+  id           Int           @id @default(autoincrement())
+  sessionId    Int           @map("session_id")
+  studentId    Int           @map("student_id")
+  membershipId Int           @map("membership_id")
+  status       BookingStatus @default(booked)
+  markedById   Int?          @map("marked_by_id") // coach que pasó lista
+  markedAt     DateTime?     @map("marked_at") @db.Timestamptz
+  cancelledAt  DateTime?     @map("cancelled_at") @db.Timestamptz
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime      @updatedAt @map("updated_at") @db.Timestamptz
+
+  session    ClassSession @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  student    Student      @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  membership Membership   @relation(fields: [membershipId], references: [id], onDelete: Restrict)
+  markedBy   Coach?       @relation("BookingMarkedBy", fields: [markedById], references: [id], onDelete: SetNull)
+
+  @@unique([sessionId, studentId])
+  @@index([studentId])
+  @@index([membershipId, status])
+  @@map("bookings")
+}
+
+// ─── Dinero ─────────────────────────────────────────────────────────────────
+
+/// Cada cobro, con tarjeta o en efectivo. El reparto se hace sobre net_cents.
+model Payment {
+  id                    Int           @id @default(autoincrement())
+  studentId             Int           @map("student_id")
+  membershipId          Int?          @map("membership_id")
+  method                PaymentMethod
+  status                PaymentStatus @default(pending)
+  grossCents            Int           @map("gross_cents")
+  feeCents              Int           @default(0) @map("fee_cents") // comisión de Stripe
+  netCents              Int           @map("net_cents")
+  refundedCents         Int           @default(0) @map("refunded_cents")
+  currency              String        @default("MXN") @db.Char(3)
+  stripePaymentIntentId String?       @unique @map("stripe_payment_intent_id")
+  stripeChargeId        String?       @unique @map("stripe_charge_id")
+  stripeInvoiceId       String?       @map("stripe_invoice_id")
+  payoutId              Int?          @map("payout_id") // depósito en el que llegó (tarjeta)
+  receivedById          Int?          @map("received_by_id") // coach que recibió el efectivo
+  paidAt                DateTime?     @map("paid_at") @db.Timestamptz
+  createdAt             DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt             DateTime      @updatedAt @map("updated_at") @db.Timestamptz
+
+  student     Student             @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  membership  Membership?         @relation(fields: [membershipId], references: [id], onDelete: SetNull)
+  payout      StripePayout?       @relation(fields: [payoutId], references: [id], onDelete: SetNull)
+  receivedBy  Coach?              @relation("PaymentReceivedBy", fields: [receivedById], references: [id], onDelete: SetNull)
+  allocations PaymentAllocation[]
+
+  @@index([studentId])
+  @@index([membershipId])
+  @@index([payoutId])
+  @@index([method, paidAt])
+  @@map("payments")
+}
+
+/// Cuánto de cada pago le toca a cada coach. Los reembolsos crean filas negativas.
+/// settlement_period_id se asigna al cerrar el corte semanal (efectivo por fecha de cobro,
+/// tarjeta por fecha de depósito).
+model PaymentAllocation {
+  id                 Int            @id @default(autoincrement())
+  paymentId          Int            @map("payment_id")
+  coachId            Int            @map("coach_id")
+  disciplineId       Int            @map("discipline_id")
+  kind               AllocationKind @default(sale)
+  amountCents        Int            @map("amount_cents")
+  basisPoints        Int            @map("basis_points") // porcentaje copiado del plan
+  settlementPeriodId Int?           @map("settlement_period_id")
+  createdAt          DateTime       @default(now()) @map("created_at") @db.Timestamptz
+
+  payment          Payment           @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  coach            Coach             @relation(fields: [coachId], references: [id], onDelete: Restrict)
+  discipline       Discipline        @relation(fields: [disciplineId], references: [id], onDelete: Restrict)
+  settlementPeriod SettlementPeriod? @relation(fields: [settlementPeriodId], references: [id], onDelete: SetNull)
+
+  @@index([paymentId])
+  @@index([coachId])
+  @@index([disciplineId])
+  @@index([settlementPeriodId])
+  @@map("payment_allocations")
+}
+
+/// Depósitos de Stripe a la cuenta de Nadia (webhook payout.paid).
+model StripePayout {
+  id             Int          @id @default(autoincrement())
+  stripePayoutId String       @unique @map("stripe_payout_id")
+  amountCents    Int          @map("amount_cents")
+  currency       String       @default("MXN") @db.Char(3)
+  status         PayoutStatus
+  arrivalDate    DateTime     @map("arrival_date") @db.Date
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime     @updatedAt @map("updated_at") @db.Timestamptz
+
+  payments Payment[]
+
+  @@index([arrivalDate])
+  @@map("stripe_payouts")
+}
+
+/// Corte semanal (lunes a domingo). Al cerrarse queda congelado.
+model SettlementPeriod {
+  id        Int                    @id @default(autoincrement())
+  weekStart DateTime               @unique @map("week_start") @db.Date
+  weekEnd   DateTime               @map("week_end") @db.Date
+  status    SettlementPeriodStatus @default(open)
+  closedAt  DateTime?              @map("closed_at") @db.Timestamptz
+  summary   Json? // saldos calculados al cerrar: quién le debe a quién
+
+  allocations PaymentAllocation[]
+  settlements Settlement[]
+
+  @@map("settlement_periods")
+}
+
+/// Entrega de dinero entre coaches ("se dan su mitad").
+model Settlement {
+  id          Int              @id @default(autoincrement())
+  periodId    Int              @map("period_id")
+  fromCoachId Int              @map("from_coach_id")
+  toCoachId   Int              @map("to_coach_id")
+  amountCents Int              @map("amount_cents")
+  method      SettlementMethod
+  paidAt      DateTime         @map("paid_at") @db.Timestamptz
+  notes       String?
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz
+
+  period    SettlementPeriod @relation(fields: [periodId], references: [id], onDelete: Restrict)
+  fromCoach Coach            @relation("SettlementFrom", fields: [fromCoachId], references: [id], onDelete: Restrict)
+  toCoach   Coach            @relation("SettlementTo", fields: [toCoachId], references: [id], onDelete: Restrict)
+
+  @@index([periodId])
+  @@index([fromCoachId])
+  @@index([toCoachId])
+  @@map("settlements")
+}
+
+// ─── Gamificación ───────────────────────────────────────────────────────────
+
+/// Racha personal: días con asistencia; se brincan los días que no son de entrenamiento
+/// de su membresía y los días sin sesiones.
+model StudentStreak {
+  studentId      Int       @id @map("student_id")
+  currentStreak  Int       @default(0) @map("current_streak")
+  bestStreak     Int       @default(0) @map("best_streak")
+  lastAttendedOn DateTime? @map("last_attended_on") @db.Date
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@map("student_streaks")
+}
+
+/// Reconocimientos del mes: días asistidos; los empates comparten lugar (1, 1, 2).
+model LeaderboardEntry {
+  id           Int      @id @default(autoincrement())
+  month        DateTime @db.Date // primer día del mes
+  studentId    Int      @map("student_id")
+  daysAttended Int      @map("days_attended") @db.SmallInt
+  position     Int      @db.SmallInt
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@unique([month, studentId])
+  @@index([month, position])
+  @@map("leaderboard_entries")
+}
+
+// ─── Configuración y legal ──────────────────────────────────────────────────
+
+/// Políticas que se cambian sin reprogramar: devolver crédito si falta, días para pagar en
+/// efectivo, apertura de reservas (sábado 06:00), zona horaria, etc.
+model StudioSetting {
+  key         String   @id
+  value       Json
+  description String?
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("studio_settings")
+}
+
+model LegalDocument {
+  id          Int               @id @default(autoincrement())
+  kind        LegalDocumentKind
+  version     String
+  content     String
+  publishedAt DateTime          @map("published_at") @db.Timestamptz
+  isCurrent   Boolean           @default(false) @map("is_current")
+
+  acceptances LegalAcceptance[]
+
+  @@unique([kind, version])
+  @@map("legal_documents")
+}
+
+model LegalAcceptance {
+  id         Int      @id @default(autoincrement())
+  documentId Int      @map("document_id")
+  studentId  Int      @map("student_id")
+  acceptedAt DateTime @default(now()) @map("accepted_at") @db.Timestamptz
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent")
+
+  document LegalDocument @relation(fields: [documentId], references: [id], onDelete: Restrict)
+  student  Student       @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, studentId])
+  @@index([studentId])
+  @@map("legal_acceptances")
+}

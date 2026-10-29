@@ -1,0 +1,7 @@
+﻿node_modules
+dist
+.env
+coverage
+# Cliente de Prisma (se genera con npm install o npm run db:generate)
+src/generated
+.test-dist
