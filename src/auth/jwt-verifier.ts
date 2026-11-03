@@ -10,7 +10,7 @@ import {
 export interface SupabaseClaims extends JWTPayload {
   sub: string;
   email?: string;
-  user_metadata?: { full_name?: string; name?: string };
+  user_metadata?: { full_name?: string; name?: string; terms_version?: string };
 }
 
 /**

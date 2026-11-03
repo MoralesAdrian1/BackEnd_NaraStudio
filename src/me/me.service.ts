@@ -3,6 +3,7 @@ import { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import type { AuthUser } from '../auth/auth-user.js';
 import type { UpdateHealthDto, UpdateMeDto } from './me.dto.js';
+import { TERMS_VERSION } from '../common/legal.js';
 
 const ME_INCLUDE = {
   student: { include: { health: true } },
@@ -24,6 +25,8 @@ export class MeService {
     if (!email) throw new BadRequestException('La cuenta no tiene correo');
     const meta = user.claims.user_metadata;
     const fullName = meta?.full_name ?? meta?.name ?? email.split('@')[0];
+    // Al crear la cuenta con correo ya aceptó los documentos (viene en sus metadatos)
+    const accepted = meta?.terms_version === TERMS_VERSION;
 
     try {
       await this.prisma.profile.create({
@@ -32,6 +35,7 @@ export class MeService {
           role: 'student',
           fullName,
           email,
+          ...(accepted && { termsVersion: TERMS_VERSION, termsAcceptedAt: new Date() }),
           student: { create: { fullName, email } },
         },
       });
@@ -52,7 +56,12 @@ export class MeService {
     await this.prisma.$transaction(async (tx) => {
       await tx.profile.update({
         where: { id: me.id },
-        data: { fullName: dto.fullName, phone: dto.phone, birthDate },
+        data: {
+          fullName: dto.fullName,
+          phone: dto.phone,
+          birthDate,
+          ...(dto.acceptTerms && { termsVersion: TERMS_VERSION, termsAcceptedAt: new Date() }),
+        },
       });
       if (me.student) {
         await tx.student.update({
@@ -102,6 +111,7 @@ export class MeService {
   /** Perfil + qué datos le faltan por completar (para el registro con Google o Facebook). */
   private present(me: Me) {
     const missing: string[] = [];
+    if (me.termsVersion !== TERMS_VERSION) missing.push('terms');
     if (!me.phone) missing.push('phone');
     if (!me.birthDate) missing.push('birthDate');
     if (me.student) {

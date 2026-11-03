@@ -42,6 +42,11 @@ export class UpdateMeDto {
   @IsString()
   @MaxLength(200)
   photoPath?: string;
+
+  /** Acepta los términos y el aviso de privacidad vigentes; solo se puede aceptar, no deshacer */
+  @IsOptional()
+  @Equals(true, { message: 'Para continuar acepta los términos y el aviso de privacidad' })
+  acceptTerms?: boolean;
 }
 
 /** Datos sensibles: solo se guardan con consentimiento explícito. */

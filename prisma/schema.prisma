@@ -130,6 +130,9 @@ model Profile {
   phone     String?
   birthDate DateTime? @map("birth_date") @db.Date
   isActive  Boolean   @default(true) @map("is_active")
+  /// Versión de los términos y el aviso de privacidad que aceptó (ver src/common/legal.ts)
+  termsVersion    String?   @map("terms_version")
+  termsAcceptedAt DateTime? @map("terms_accepted_at") @db.Timestamptz
   createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
   updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz
 
