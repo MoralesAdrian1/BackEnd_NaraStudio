@@ -3,7 +3,7 @@ import type { AuthUser } from '../auth/auth-user.js';
 import { CurrentUser, Roles } from '../auth/decorators.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { SettingsService } from '../settings/settings.service.js';
-import { CashRequestDto, CollectDto, CreateStudentDto, SellDto, StudentsQuery } from './memberships.dto.js';
+import { CashRequestDto, CollectDto, CreateStudentDto, SellAtClassDto, SellDto, StudentsQuery } from './memberships.dto.js';
 import { MEMBERSHIP_INCLUDE, MembershipsService, present } from './memberships.service.js';
 import { StudentsService } from './students.service.js';
 
@@ -62,6 +62,13 @@ export class MembershipsController {
   @Post('sell')
   sell(@CurrentUser() user: AuthUser, @Body() dto: SellDto) {
     return this.memberships.sell(user, dto);
+  }
+
+  /** En la clase: llegó sin plan y paga la clase individual en efectivo */
+  @Roles('coach')
+  @Post('sell-at-class')
+  sellAtClass(@CurrentUser() user: AuthUser, @Body() dto: SellAtClassDto) {
+    return this.memberships.sellAtClass(user, dto.sessionId, dto.studentId);
   }
 
   @Roles('admin')

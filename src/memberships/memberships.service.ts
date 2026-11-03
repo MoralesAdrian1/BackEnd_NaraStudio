@@ -14,7 +14,7 @@ import { STUDIO_TZ, studioDate } from '../common/studio-time.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { SettingsService } from '../settings/settings.service.js';
 import type { CashRequestDto, SellDto } from './memberships.dto.js';
-import { assertTeaches, ATTENDANCE_OPENS_MS, BookingsService } from '../bookings/bookings.service.js';
+import { assertTeaches, ATTENDANCE_OPENS_MS, BookingsService, singleClassPlan } from '../bookings/bookings.service.js';
 import { consuming, payDeadline } from '../bookings/rules.js';
 import { PurchaseMails } from './purchase-mails.js';
 import { splitAmount } from './split.js';
@@ -196,10 +196,43 @@ export class MembershipsService {
   }
 
   /**
-   * Activa la membresía, crea el pago en efectivo y su reparto, todo junto. Con attendBookingId
-   * (cobro al pasar lista) también marca la asistencia a esa clase.
+   * Llegó a la clase sin plan: se le vende la clase individual de la disciplina, se cobra en
+   * efectivo y queda con asistencia. Se puede mientras la lista está abierta y la clase no termina.
    */
-  private async activateWithCash(user: AuthUser, id: number, attendBookingId?: number) {
+  async sellAtClass(user: AuthUser, sessionId: number, studentId: number) {
+    const session = await this.prisma.classSession.findUnique({ where: { id: sessionId }, include: { class: true } });
+    if (!session) throw new NotFoundException('La sesión no existe');
+    assertTeaches(user, session);
+    const now = Date.now();
+    if (session.status !== 'scheduled' || session.endsAt.getTime() <= now) {
+      throw new BadRequestException('Esa clase ya terminó o está cancelada');
+    }
+    if (now < session.startsAt.getTime() - ATTENDANCE_OPENS_MS) {
+      throw new BadRequestException('La lista se pasa a partir de 2 horas antes de la clase');
+    }
+    const plan = await singleClassPlan(this.prisma, session.class.disciplineId);
+    if (!plan) throw new BadRequestException('No hay una clase individual a la venta para esta disciplina. Créala en “Planes”.');
+    const student = await this.prisma.student.findUnique({ where: { id: studentId } });
+    if (!student?.isActive) throw new NotFoundException('La alumna no existe');
+
+    const created = await this.prisma.membership.create({
+      data: { ...snapshot(plan, session.id), studentId, status: 'pending_payment' },
+    });
+    try {
+      return await this.activateWithCash(user, created.id, undefined, true);
+    } catch (e) {
+      // Sin lugar o ya en la lista: no queda una venta a medias
+      await this.prisma.membership.delete({ where: { id: created.id } });
+      throw e;
+    }
+  }
+
+  /**
+   * Activa la membresía, crea el pago en efectivo y su reparto, todo junto. Con attendBookingId
+   * (cobro al pasar lista) también marca la asistencia a esa clase; con atClass, la clase
+   * individual vendida en la clase queda con asistencia aunque ya haya empezado.
+   */
+  private async activateWithCash(user: AuthUser, id: number, attendBookingId?: number, atClass = false) {
     const coachId = coachIdOf(user);
     const now = new Date();
 
@@ -233,10 +266,10 @@ export class MembershipsService {
         // Venta en persona de la clase individual: todavía no tiene lugar
         const refundNoShow = await this.settings.get('refund_credit_on_no_show', true);
         const session = await this.bookings.lockSession(tx, m.classSessionId);
-        if (session.status !== 'scheduled' || session.startsAt <= now) {
+        if (session.status !== 'scheduled' || (atClass ? session.endsAt : session.startsAt) <= now) {
           throw new BadRequestException('Esa clase ya no está disponible');
         }
-        await this.bookings.reserve(tx, session, m.studentId, refundNoShow, 'booked', null);
+        await this.bookings.reserve(tx, session, m.studentId, refundNoShow, atClass ? 'attended' : 'booked', atClass ? coachId : null);
       }
 
       const allocations = splitAmount(m.pricePaidCents, m.plan.revenueShares);

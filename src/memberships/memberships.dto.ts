@@ -16,6 +16,15 @@ export class SellDto extends CashRequestDto {
   studentId!: number;
 }
 
+/** Llegó a la clase sin plan: se le cobra la clase individual y queda con asistencia. */
+export class SellAtClassDto {
+  @IsInt()
+  sessionId!: number;
+
+  @IsInt()
+  studentId!: number;
+}
+
 /** Cobrar al pasar lista: la reserva que se paga. */
 export class CollectDto {
   @IsInt()
