@@ -3,7 +3,7 @@ import type { AuthUser } from '../auth/auth-user.js';
 import { CurrentUser, Roles } from '../auth/decorators.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { SettingsService } from '../settings/settings.service.js';
-import { CashRequestDto, CollectDto, CreateStudentDto, SellAtClassDto, SellDto, StudentsQuery } from './memberships.dto.js';
+import { CashRequestDto, CollectDto, CreateStudentDto, ImportStudentsDto, SellAtClassDto, SellDto, StudentsQuery } from './memberships.dto.js';
 import { MEMBERSHIP_INCLUDE, MembershipsService, present } from './memberships.service.js';
 import { StudentsService } from './students.service.js';
 
@@ -96,6 +96,13 @@ export class StudentsController {
   @Post()
   create(@CurrentUser() user: AuthUser, @Body() dto: CreateStudentDto) {
     return this.students.create(user, dto);
+  }
+
+  /** Carga masiva desde el Excel de alumnas */
+  @Roles('admin')
+  @Post('import')
+  importMany(@CurrentUser() user: AuthUser, @Body() dto: ImportStudentsDto) {
+    return this.students.importMany(user, dto);
   }
 
   /** Vuelve a mandar la invitación (o crea la cuenta a una alumna registrada sin ella). */

@@ -6,7 +6,10 @@ import { SupabaseAdmin } from '../auth/supabase-admin.js';
 import { MailService } from '../mail/mail.service.js';
 import { invitation } from '../mail/templates.js';
 import { PrismaService } from '../prisma/prisma.service.js';
-import type { CreateStudentDto } from './memberships.dto.js';
+import type { CreateStudentDto, ImportStudentsDto } from './memberships.dto.js';
+
+// Resend acepta 2 correos por segundo
+const MAIL_GAP_MS = 600;
 
 @Injectable()
 export class StudentsService {
@@ -147,6 +150,69 @@ export class StudentsService {
       throw e;
     }
     return { invitationSent: await this.sendInvitation(email, s.fullName) };
+  }
+
+  /**
+   * Carga masiva (Excel) de las alumnas que ya iban al estudio. Se saltan las que ya están por
+   * correo o celular. Las invitaciones salen después, una por una, para no esperar a todas.
+   */
+  async importMany(user: AuthUser, dto: ImportStudentsDto) {
+    const registeredById = user.profile?.coach?.id ?? null;
+    const rows = dto.rows.map((r, i) => ({
+      row: r.line ?? i + 2, // fila del Excel: la 1 son los encabezados
+      fullName: r.fullName.trim().replace(/\s+/g, ' '),
+      email: r.email?.trim().toLowerCase() || undefined,
+      phone: r.phone?.trim() || undefined,
+      birthDate: r.birthDate ? new Date(r.birthDate) : undefined,
+      address: r.address?.trim() || undefined,
+    }));
+    const emails = rows.flatMap((r) => (r.email ? [r.email] : []));
+    const phones = rows.flatMap((r) => (r.phone ? [r.phone] : []));
+    const [students, profiles] = await Promise.all([
+      this.prisma.student.findMany({
+        where: { OR: [{ email: { in: emails, mode: 'insensitive' } }, { phone: { in: phones } }] },
+        select: { email: true, phone: true },
+      }),
+      this.prisma.profile.findMany({ where: { email: { in: emails } }, select: { email: true } }),
+    ]);
+    const takenEmails = new Set([...students.map((s) => s.email?.toLowerCase()), ...profiles.map((p) => p.email)]);
+    const takenPhones = new Set(students.map((s) => s.phone));
+
+    const skipped: { row: number; fullName: string; reason: string }[] = [];
+    const fresh = rows.filter((r) => {
+      const reason =
+        r.email && takenEmails.has(r.email)
+          ? 'Ya hay una alumna con ese correo'
+          : r.phone && takenPhones.has(r.phone)
+            ? 'Ya hay una alumna con ese celular'
+            : null;
+      if (reason) skipped.push({ row: r.row, fullName: r.fullName, reason });
+      if (r.email) takenEmails.add(r.email);
+      if (r.phone) takenPhones.add(r.phone);
+      return !reason;
+    });
+
+    const created = await this.prisma.$transaction(
+      fresh.map(({ row: _row, ...data }) =>
+        this.prisma.student.create({ data: { ...data, registeredById }, select: { id: true, email: true } }),
+      ),
+    );
+    const toInvite = dto.invite ? created.filter((s) => s.email).map((s) => s.id) : [];
+    if (toInvite.length) void this.inviteAll(user, toInvite);
+    return { created: created.length, skipped, invitations: toInvite.length };
+  }
+
+  private async inviteAll(user: AuthUser, ids: number[]) {
+    let sent = 0;
+    for (const id of ids) {
+      try {
+        if ((await this.invite(user, id)).invitationSent) sent++;
+      } catch (e) {
+        this.logger.warn(`Carga masiva: no se invitó a la alumna ${id}: ${(e as Error).message}`);
+      }
+      await new Promise((r) => setTimeout(r, MAIL_GAP_MS));
+    }
+    this.logger.log(`Carga masiva: ${sent} de ${ids.length} invitaciones enviadas`);
   }
 
   /** La cuenta ya existe: si el correo falla, la alumna puede usar “¿Olvidaste tu contraseña?”. */
