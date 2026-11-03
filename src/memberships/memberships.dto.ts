@@ -10,7 +10,9 @@ import {
   IsOptional,
   IsString,
   Length,
+  Max,
   MaxLength,
+  Min,
   ValidateNested,
 } from 'class-validator';
 
@@ -95,10 +97,22 @@ export class ImportStudentRow {
   @IsISO8601({ strict: true })
   birthDate?: string;
 
+  /** Membresía que ya tenía en el estudio (opcional) */
   @IsOptional()
-  @IsString()
-  @MaxLength(300)
-  address?: string;
+  @IsInt()
+  planId?: number;
+
+  /** Desde cuándo corre su vigencia (AAAA-MM-DD); si falta, desde hoy */
+  @IsOptional()
+  @IsISO8601({ strict: true })
+  startDate?: string;
+
+  /** Clases que le quedan, para los paquetes; si falta, las del plan */
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(999)
+  credits?: number;
 }
 
 export class ImportStudentsDto {

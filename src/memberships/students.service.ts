@@ -6,10 +6,12 @@ import { SupabaseAdmin } from '../auth/supabase-admin.js';
 import { MailService } from '../mail/mail.service.js';
 import { invitation } from '../mail/templates.js';
 import { PrismaService } from '../prisma/prisma.service.js';
+import { studioDate, studioDateTime } from '../common/studio-time.js';
 import type { CreateStudentDto, ImportStudentsDto } from './memberships.dto.js';
 
 // Resend acepta 2 correos por segundo
 const MAIL_GAP_MS = 600;
+const DAY_MS = 86_400_000;
 
 @Injectable()
 export class StudentsService {
@@ -157,14 +159,26 @@ export class StudentsService {
    * correo o celular. Las invitaciones salen después, una por una, para no esperar a todas.
    */
   async importMany(user: AuthUser, dto: ImportStudentsDto) {
-    const registeredById = user.profile?.coach?.id ?? null;
+    const coachId = user.profile?.coach?.id ?? null;
+    const now = new Date();
+    const plans = new Map(
+      (
+        await this.prisma.plan.findMany({
+          where: { id: { in: dto.rows.flatMap((r) => (r.planId ? [r.planId] : [])) }, isActive: true, kind: { not: 'single_class' } },
+        })
+      ).map((p) => [p.id, p]),
+    );
+    const today = studioDate(now);
     const rows = dto.rows.map((r, i) => ({
       row: r.line ?? i + 2, // fila del Excel: la 1 son los encabezados
       fullName: r.fullName.trim().replace(/\s+/g, ' '),
       email: r.email?.trim().toLowerCase() || undefined,
       phone: r.phone?.trim() || undefined,
       birthDate: r.birthDate ? new Date(r.birthDate) : undefined,
-      address: r.address?.trim() || undefined,
+      plan: r.planId ? plans.get(r.planId) : undefined,
+      planId: r.planId,
+      startsAt: studioDateTime(r.startDate ?? today, '00:00'),
+      credits: r.credits,
     }));
     const emails = rows.flatMap((r) => (r.email ? [r.email] : []));
     const phones = rows.flatMap((r) => (r.phone ? [r.phone] : []));
@@ -178,7 +192,9 @@ export class StudentsService {
     const takenEmails = new Set([...students.map((s) => s.email?.toLowerCase()), ...profiles.map((p) => p.email)]);
     const takenPhones = new Set(students.map((s) => s.phone));
 
-    const skipped: { row: number; fullName: string; reason: string }[] = [];
+    type Note = { row: number; fullName: string; reason: string };
+    const skipped: Note[] = [];
+    const warnings: Note[] = [];
     const fresh = rows.filter((r) => {
       const reason =
         r.email && takenEmails.has(r.email)
@@ -193,13 +209,46 @@ export class StudentsService {
     });
 
     const created = await this.prisma.$transaction(
-      fresh.map(({ row: _row, ...data }) =>
-        this.prisma.student.create({ data: { ...data, registeredById }, select: { id: true, email: true } }),
-      ),
+      fresh.map((r) => {
+        const { plan } = r;
+        const expiresAt = plan && new Date(r.startsAt.getTime() + plan.durationDays * DAY_MS);
+        if (r.planId && !plan) warnings.push({ row: r.row, fullName: r.fullName, reason: 'Se registró sin membresía: el plan ya no está activo' });
+        else if (expiresAt && expiresAt <= now) {
+          warnings.push({ row: r.row, fullName: r.fullName, reason: 'Se registró sin membresía: ya había vencido' });
+        }
+        const active = plan && expiresAt && expiresAt > now;
+        return this.prisma.student.create({
+          data: {
+            fullName: r.fullName,
+            email: r.email,
+            phone: r.phone,
+            birthDate: r.birthDate,
+            registeredById: coachId,
+            // Membresía que ya pagó en el estudio: entra activa y sin cobro en la app
+            memberships: active
+              ? {
+                  create: {
+                    planId: plan.id,
+                    status: 'active',
+                    creditsTotal: plan.credits === null ? null : (r.credits ?? plan.credits),
+                    pricePaidCents: 0,
+                    currency: plan.currency,
+                    trainingDays: plan.trainingDays,
+                    startsAt: r.startsAt,
+                    expiresAt,
+                    approvedById: coachId,
+                    approvedAt: now,
+                  },
+                }
+              : undefined,
+          },
+          select: { id: true, email: true },
+        });
+      }),
     );
     const toInvite = dto.invite ? created.filter((s) => s.email).map((s) => s.id) : [];
     if (toInvite.length) void this.inviteAll(user, toInvite);
-    return { created: created.length, skipped, invitations: toInvite.length };
+    return { created: created.length, skipped, warnings, invitations: toInvite.length };
   }
 
   private async inviteAll(user: AuthUser, ids: number[]) {
