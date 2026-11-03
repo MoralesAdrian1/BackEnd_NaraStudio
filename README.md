@@ -130,3 +130,15 @@ Nest is an MIT-licensed open source project. It can grow thanks to the sponsors 
 ## License
 
 Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+
+## Entorno local (rama `dev`)
+
+En local se usa un proyecto de Supabase de **pruebas**, nunca el de producción.
+
+1. `backend/.env` y `frontend/.env.development.local` llevan las claves del proyecto de pruebas.
+2. Primera vez: `npm run db:deploy`, `npm run db:seed-schedule`, `npm run db:seed-plans`.
+3. Crea tu cuenta en http://localhost:5173/entrar y date rol: `npm run auth:role -- tu@correo.com admin barre`.
+4. Diario: `npm run dev` aquí y `npm run dev` en `frontend/`; abre http://localhost:5173.
+
+Sin `RESEND_API_KEY` los correos no salen: se escriben en esta terminal con sus enlaces (la invitación, por ejemplo).
+Para migrar producción desde tu máquina: `npm run db:deploy:prod` (usa `.env.produccion`).

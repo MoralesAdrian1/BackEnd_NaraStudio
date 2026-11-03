@@ -26,6 +26,7 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
+    "db:deploy:prod": "node --env-file=.env.produccion node_modules/prisma/build/index.js migrate deploy",
     "db:studio": "prisma studio",
     "auth:role": "node --env-file=.env scripts/set-role.mjs",
     "db:seed-schedule": "node --env-file=.env scripts/seed-schedule.mjs",

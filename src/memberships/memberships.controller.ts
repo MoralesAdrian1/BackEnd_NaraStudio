@@ -64,11 +64,11 @@ export class MembershipsController {
     return this.memberships.sell(user, dto);
   }
 
-  /** En la clase: llegó sin plan y paga la clase individual en efectivo */
+  /** En la clase: llegó sin plan y paga en efectivo la clase individual o una membresía */
   @Roles('coach')
   @Post('sell-at-class')
   sellAtClass(@CurrentUser() user: AuthUser, @Body() dto: SellAtClassDto) {
-    return this.memberships.sellAtClass(user, dto.sessionId, dto.studentId);
+    return this.memberships.sellAtClass(user, dto);
   }
 
   @Roles('admin')

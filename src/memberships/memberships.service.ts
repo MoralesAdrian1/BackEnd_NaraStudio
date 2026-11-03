@@ -13,8 +13,8 @@ import { coachIdOf, isAdmin } from '../auth/permissions.js';
 import { STUDIO_TZ, studioDate } from '../common/studio-time.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { SettingsService } from '../settings/settings.service.js';
-import type { CashRequestDto, SellDto } from './memberships.dto.js';
-import { assertTeaches, ATTENDANCE_OPENS_MS, BookingsService, singleClassPlan } from '../bookings/bookings.service.js';
+import type { CashRequestDto, SellAtClassDto, SellDto } from './memberships.dto.js';
+import { assertTeaches, ATTENDANCE_OPENS_MS, BookingsService } from '../bookings/bookings.service.js';
 import { consuming, payDeadline } from '../bookings/rules.js';
 import { PurchaseMails } from './purchase-mails.js';
 import { splitAmount } from './split.js';
@@ -179,7 +179,7 @@ export class MembershipsService {
     if (Date.now() < b.session.startsAt.getTime() - ATTENDANCE_OPENS_MS) {
       throw new BadRequestException('La lista se pasa a partir de 2 horas antes de la clase');
     }
-    return this.activateWithCash(user, b.membershipId, b.id);
+    return this.activateWithCash(user, b.membershipId, { attendBookingId: b.id });
   }
 
   /** Venta en persona: la coach registra el plan de una alumna y el pago en efectivo. */
@@ -196,10 +196,11 @@ export class MembershipsService {
   }
 
   /**
-   * Llegó a la clase sin plan: se le vende la clase individual de la disciplina, se cobra en
-   * efectivo y queda con asistencia. Se puede mientras la lista está abierta y la clase no termina.
+   * Llegó a la clase sin plan: se le vende la clase individual o una membresía de la disciplina,
+   * se cobra en efectivo y queda con asistencia (gasta un crédito). Se puede mientras la lista está
+   * abierta y la clase no termina.
    */
-  async sellAtClass(user: AuthUser, sessionId: number, studentId: number) {
+  async sellAtClass(user: AuthUser, { sessionId, studentId, planId }: SellAtClassDto) {
     const session = await this.prisma.classSession.findUnique({ where: { id: sessionId }, include: { class: true } });
     if (!session) throw new NotFoundException('La sesión no existe');
     assertTeaches(user, session);
@@ -210,16 +211,19 @@ export class MembershipsService {
     if (now < session.startsAt.getTime() - ATTENDANCE_OPENS_MS) {
       throw new BadRequestException('La lista se pasa a partir de 2 horas antes de la clase');
     }
-    const plan = await singleClassPlan(this.prisma, session.class.disciplineId);
-    if (!plan) throw new BadRequestException('No hay una clase individual a la venta para esta disciplina. Créala en “Planes”.');
+    const plan = await this.prisma.plan.findUnique({ where: { id: planId }, include: { revenueShares: true } });
+    if (!plan?.isActive) throw new NotFoundException('El plan no existe o ya no está disponible');
+    if (!plan.revenueShares.some((s) => s.disciplineId === session.class.disciplineId)) {
+      throw new BadRequestException('Ese plan no incluye esta clase');
+    }
     const student = await this.prisma.student.findUnique({ where: { id: studentId } });
     if (!student?.isActive) throw new NotFoundException('La alumna no existe');
 
     const created = await this.prisma.membership.create({
-      data: { ...snapshot(plan, session.id), studentId, status: 'pending_payment' },
+      data: { ...snapshot(plan, plan.kind === 'single_class' ? session.id : undefined), studentId, status: 'pending_payment' },
     });
     try {
-      return await this.activateWithCash(user, created.id, undefined, true);
+      return await this.activateWithCash(user, created.id, { atSessionId: session.id });
     } catch (e) {
       // Sin lugar o ya en la lista: no queda una venta a medias
       await this.prisma.membership.delete({ where: { id: created.id } });
@@ -229,14 +233,24 @@ export class MembershipsService {
 
   /**
    * Activa la membresía, crea el pago en efectivo y su reparto, todo junto. Con attendBookingId
-   * (cobro al pasar lista) también marca la asistencia a esa clase; con atClass, la clase
-   * individual vendida en la clase queda con asistencia aunque ya haya empezado.
+   * (cobro al pasar lista) también marca la asistencia a esa clase; con atSessionId (venta en la
+   * clase) la agrega a esa clase con asistencia, aunque ya haya empezado.
    */
-  private async activateWithCash(user: AuthUser, id: number, attendBookingId?: number, atClass = false) {
+  private async activateWithCash(
+    user: AuthUser,
+    id: number,
+    { attendBookingId, atSessionId }: { attendBookingId?: number; atSessionId?: number } = {},
+  ) {
     const coachId = coachIdOf(user);
     const now = new Date();
+    const refundNoShow = await this.settings.get('refund_credit_on_no_show', true);
 
     await this.prisma.$transaction(async (tx) => {
+      // Venta en la clase: primero la sesión, en el mismo orden que al reservar
+      const atSession = atSessionId ? await this.bookings.lockSession(tx, atSessionId) : null;
+      if (atSession && (atSession.status !== 'scheduled' || atSession.endsAt <= now)) {
+        throw new BadRequestException('Esa clase ya terminó o está cancelada');
+      }
       // Bloquea la membresía: dos cobros a la vez (o el vencimiento) no la procesan dos veces
       await tx.$queryRaw`SELECT id FROM memberships WHERE id = ${id} FOR UPDATE`;
       const m = await tx.membership.findUniqueOrThrow({
@@ -249,7 +263,7 @@ export class MembershipsService {
       });
       if (m.status !== 'pending_payment') throw new BadRequestException('Esta solicitud ya no está pendiente');
       // Si ya está en la clase de su ficha, la vigencia cuenta desde esa clase
-      const first = m.bookings[0]?.session.startsAt;
+      const first = m.bookings[0]?.session.startsAt ?? atSession?.startsAt;
       const startsAt = first && first < now ? first : now;
       const expiresAt = m.classSession
         ? m.classSession.endsAt
@@ -262,14 +276,15 @@ export class MembershipsService {
 
       if (attendBookingId) {
         await tx.booking.update({ where: { id: attendBookingId }, data: { status: 'attended', markedById: coachId, markedAt: now } });
+      } else if (atSession) {
+        await this.bookings.reserve(tx, atSession, m.studentId, refundNoShow, 'attended', coachId);
       } else if (m.classSessionId && !m.bookings.length) {
         // Venta en persona de la clase individual: todavía no tiene lugar
-        const refundNoShow = await this.settings.get('refund_credit_on_no_show', true);
         const session = await this.bookings.lockSession(tx, m.classSessionId);
-        if (session.status !== 'scheduled' || (atClass ? session.endsAt : session.startsAt) <= now) {
+        if (session.status !== 'scheduled' || session.startsAt <= now) {
           throw new BadRequestException('Esa clase ya no está disponible');
         }
-        await this.bookings.reserve(tx, session, m.studentId, refundNoShow, atClass ? 'attended' : 'booked', atClass ? coachId : null);
+        await this.bookings.reserve(tx, session, m.studentId, refundNoShow, 'booked', null);
       }
 
       const allocations = splitAmount(m.pricePaidCents, m.plan.revenueShares);

@@ -194,12 +194,16 @@ export class BookingsService {
     if (!session) throw new NotFoundException('La sesión no existe');
     assertTeaches(user, session);
     const booked = session.bookings.filter((b) => OCCUPYING.includes(b.status)).length;
-    const walkIn = await singleClassPlan(this.prisma, session.class.disciplineId);
+    const salePlans = await this.prisma.plan.findMany({
+      where: { isActive: true, revenueShares: { some: { disciplineId: session.class.disciplineId } } },
+      select: { id: true, name: true, kind: true, credits: true, priceCents: true },
+      orderBy: [{ priceCents: 'asc' }, { id: 'asc' }],
+    });
     return {
       id: session.id,
       className: session.class.name,
-      // Lo que se cobra a quien llega sin plan
-      walkInPlan: walkIn && { name: walkIn.name, priceCents: walkIn.priceCents },
+      // Lo que se le puede cobrar a quien llega sin plan
+      salePlans,
       startsAt: session.startsAt,
       status: session.status,
       capacity: session.capacity,
@@ -447,14 +451,6 @@ function studentIdOf(user: AuthUser) {
  * Pasa lista quien da la sesión (o la dueña de la clase) y el admin. Así, en el plan
  * combinado, cada coach registra la asistencia de las alumnas que van a su clase.
  */
-/** La clase individual a la venta para una disciplina (la más barata si hay varias). */
-export function singleClassPlan(db: PrismaService | Tx, disciplineId: number) {
-  return db.plan.findFirst({
-    where: { isActive: true, kind: 'single_class', revenueShares: { some: { disciplineId } } },
-    orderBy: [{ priceCents: 'asc' }, { id: 'asc' }],
-  });
-}
-
 export function assertTeaches(user: AuthUser, s: { coachId: number; classCoachId?: number; class?: { coachId: number } }) {
   if (isAdmin(user)) return;
   const me = coachIdOf(user);

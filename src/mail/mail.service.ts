@@ -27,7 +27,10 @@ export class MailService {
     if (!to.length) return;
     if (!this.key) {
       const text = mail.html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-      this.logger.log(`[sin RESEND_API_KEY] "${mail.subject}" → ${to.join(', ')}: ${text}`);
+      // Los enlaces (invitación, contraseña) se pierden al quitar las etiquetas: van aparte
+      const links = [...mail.html.matchAll(/href="([^"]+)"/g)].map((m) => m[1].replaceAll('&amp;', '&'));
+      this.logger.log(`[sin RESEND_API_KEY] "${mail.subject}" → ${to.join(', ')}: ${text}${links.length ? `
+Enlaces: ${links.join(' ')}` : ''}`);
       return;
     }
     try {

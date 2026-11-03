@@ -5,3 +5,7 @@ coverage
 # Cliente de Prisma (se genera con npm install o npm run db:generate)
 src/generated
 .test-dist
+
+# Copias locales de otros entornos (.env.produccion)
+.env.*
+!.env.example
