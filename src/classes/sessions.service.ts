@@ -21,6 +21,9 @@ import {
   timeOnly,
   weekStart,
 } from '../common/studio-time.js';
+import { ConfigService } from '@nestjs/config';
+import { MailService } from '../mail/mail.service.js';
+import { classCancelled, type CancelOutcome } from '../mail/templates.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { SettingsService } from '../settings/settings.service.js';
 import type { CreateSessionDto } from './classes.dto.js';
@@ -45,6 +48,8 @@ export class SessionsService implements OnApplicationBootstrap {
   constructor(
     private readonly prisma: PrismaService,
     private readonly settings: SettingsService,
+    private readonly mail: MailService,
+    private readonly config: ConfigService,
   ) {}
 
   onApplicationBootstrap() {
@@ -171,14 +176,23 @@ export class SessionsService implements OnApplicationBootstrap {
 
   /** Cancela sesiones futuras y libera sus reservas, en una sola transacción. */
   async cancelMany(where: Prisma.Sql, reason: string): Promise<[number, number]> {
-    return this.prisma.$transaction(async (tx) => {
+    const { result, notices } = await this.prisma.$transaction(async (tx) => {
       const ids = await tx.$queryRaw<{ id: number }[]>`
         UPDATE class_sessions
         SET status = 'cancelled', cancel_reason = ${reason}, cancelled_at = now()
         WHERE status = 'scheduled' AND ${where}
         RETURNING id`;
-      if (!ids.length) return [0, 0];
+      if (!ids.length) return { result: [0, 0] as [number, number], notices: [] };
       const sessionIds = ids.map((r) => r.id);
+      // Quiénes tenían lugar, antes de cambiar sus membresías: a ellas se les avisa por correo
+      const notices = await tx.booking.findMany({
+        where: { sessionId: { in: sessionIds }, status: 'booked' },
+        select: {
+          student: { select: { fullName: true, email: true } },
+          session: { select: { startsAt: true, class: { select: { name: true } } } },
+          membership: { select: { status: true, classSessionId: true, creditsTotal: true } },
+        },
+      });
       // Pagos en efectivo de esas clases: la clase individual se cancela; la ficha de una
       // membresía queda libre para reservar otra clase
       const days = await this.settings.get('cash_request_days', 3);
@@ -194,8 +208,32 @@ export class SessionsService implements OnApplicationBootstrap {
         where: { sessionId: { in: sessionIds }, status: 'booked' },
         data: { status: 'cancelled_by_studio', cancelledAt: new Date() },
       });
-      return [ids.length, count];
+      return { result: [ids.length, count] as [number, number], notices };
     });
+    this.notifyCancelled(notices, reason);
+    return result;
+  }
+
+  /** Correo a cada alumna que tenía lugar: el motivo y qué pasa con su crédito o su pago. */
+  private notifyCancelled(
+    notices: {
+      student: { fullName: string; email: string | null };
+      session: { startsAt: Date; class: { name: string } };
+      membership: { status: string; classSessionId: number | null; creditsTotal: number | null } | null;
+    }[],
+    reason: string,
+  ) {
+    const link = `${this.config.get<string>('APP_URL') ?? 'http://localhost:5173'}/cuenta#reservar`;
+    for (const { student, session, membership: m } of notices) {
+      if (!student.email) continue;
+      const outcome: CancelOutcome =
+        m?.status === 'pending_payment' ? (m.classSessionId ? 'cash_class' : 'cash_token') : m?.creditsTotal === null ? 'unlimited' : 'credit';
+      const mail = classCancelled(
+        { studentName: student.fullName.split(' ')[0], className: session.class.name, classAt: session.startsAt, reason, outcome },
+        link,
+      );
+      this.mail.send({ to: student.email, ...mail }).catch((e: unknown) => this.logger.error('No se pudo avisar la cancelación', e));
+    }
   }
 
   /** Días cerrados: cancela las sesiones de ese día. */

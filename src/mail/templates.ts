@@ -142,3 +142,31 @@ export function paymentForCoach(x: PaidInfo) {
     ),
   };
 }
+
+/** Qué pasa con lo que usó para reservar la clase cancelada. */
+export type CancelOutcome = 'credit' | 'unlimited' | 'cash_class' | 'cash_token';
+
+const CANCEL_OUTCOME: Record<CancelOutcome, string> = {
+  credit: 'Te regresamos el crédito de esta clase: úsalo para reservar otra.',
+  unlimited: 'Tu plan sigue igual: reserva otra clase cuando quieras.',
+  cash_class: 'Tu solicitud de pago en efectivo para esta clase se canceló: no tienes que pagar nada.',
+  cash_token: 'Tu ficha de pago en efectivo queda libre: aparta otra clase y pagas el día que asistas.',
+};
+
+/** A la alumna: la coach (o el estudio) canceló una clase que tenía reservada. */
+export function classCancelled(x: { studentName: string; className: string; classAt: Date; reason: string; outcome: CancelOutcome }, link: string) {
+  return {
+    subject: `Se canceló tu clase: ${x.className}, ${when(x.classAt)}`,
+    html: layout(
+      `${x.studentName}, se canceló tu clase`,
+      p('Lo sentimos: la clase que reservaste ya no se va a dar.') +
+        rows([
+          ['Clase', x.className],
+          ['Cuándo', when(x.classAt)],
+          ['Motivo', x.reason],
+        ]) +
+        p(CANCEL_OUTCOME[x.outcome]) +
+        button(link, 'Reservar otra clase'),
+    ),
+  };
+}
