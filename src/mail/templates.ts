@@ -1,5 +1,7 @@
 /** Plantillas de los correos: HTML sencillo con estilos en línea (lo que aceptan los clientes de correo). */
 
+import { brand } from '../common/brand.js';
+
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 export const money = (cents: number) =>
@@ -15,17 +17,20 @@ export const when = (d: Date) =>
     minute: '2-digit',
   }).format(d);
 
-const layout = (title: string, body: string) => `<!doctype html>
-<html lang="es"><body style="margin:0;background:#f5efe9;font-family:Helvetica,Arial,sans-serif;color:#3b2d27">
+const layout = (title: string, body: string) => {
+  const { name, slogan, colors } = brand();
+  return `<!doctype html>
+<html lang="es"><body style="margin:0;background:${colors.bg};font-family:Helvetica,Arial,sans-serif;color:${colors.ink}">
   <div style="max-width:520px;margin:0 auto;padding:32px 20px">
-    <p style="margin:0 0 20px;font-size:20px;font-weight:700;letter-spacing:.04em">NARA STUDIO</p>
+    <p style="margin:0 0 20px;font-size:20px;font-weight:700;letter-spacing:.04em">${esc(name.toUpperCase())}</p>
     <div style="background:#fff;border-radius:20px;padding:28px">
       <h1 style="margin:0 0 16px;font-size:22px;line-height:1.25">${esc(title)}</h1>
       ${body}
     </div>
-    <p style="margin:20px 0 0;font-size:12px;color:#8a7a72">Nara Studio · Habita tu cuerpo</p>
+    <p style="margin:20px 0 0;font-size:12px;color:#8a7a72">${esc(slogan ? `${name} · ${slogan}` : name)}</p>
   </div>
 </body></html>`;
+};
 
 const p = (html: string) => `<p style="margin:0 0 12px;font-size:15px;line-height:1.55">${html}</p>`;
 
@@ -39,15 +44,15 @@ const rows = (items: [string, string][]) =>
     .join('')}</table>`;
 
 const button = (href: string, label: string) =>
-  `<p style="margin:20px 0 8px"><a href="${esc(href)}" style="display:inline-block;background:#9c5b43;color:#fff;` +
+  `<p style="margin:20px 0 8px"><a href="${esc(href)}" style="display:inline-block;background:${brand().colors.accent};color:#fff;` +
   `text-decoration:none;font-weight:700;padding:14px 22px;border-radius:999px">${esc(label)}</a></p>`;
 
 export function invitation(name: string, link: string) {
   return {
-    subject: 'Tu cuenta de Nara Studio está lista',
+    subject: `Tu cuenta de ${brand().name} está lista`,
     html: layout(
       `¡Hola, ${name}!`,
-      p('Tu coach te registró en Nara Studio. Crea tu contraseña para entrar a la app: ahí reservas tus clases y ves tu membresía y tu racha.') +
+      p(`Tu coach te registró en ${esc(brand().name)}. Crea tu contraseña para entrar a la app: ahí reservas tus clases y ves tu membresía y tu racha.`) +
         button(link, 'Crear mi contraseña') +
         p('<small style="color:#8a7a72">Si el botón ya no funciona, entra a la app y elige “¿Olvidaste tu contraseña?” con este mismo correo.</small>'),
     ),

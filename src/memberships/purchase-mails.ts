@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { MailService } from '../mail/mail.service.js';
+import { brand } from '../common/brand.js';
 import { cashRequested, cashRequestForCoach, paymentForCoach, receipt, type PurchaseInfo } from '../mail/templates.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 
@@ -42,7 +43,7 @@ export class PurchaseMails {
       const paid = {
         paidAt: payment.paidAt ?? new Date(),
         method: METHOD[payment.method],
-        receivedBy: payment.receivedBy?.profile.fullName ?? 'Nara Studio',
+        receivedBy: payment.receivedBy?.profile.fullName ?? brand().name,
       };
       await Promise.all([
         this.mail.send({ to: x.studentEmail, ...receipt({ ...x.info, ...paid }) }),

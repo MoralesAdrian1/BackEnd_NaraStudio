@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { brand } from '../common/brand.js';
 
 export interface Mail {
   to: string | string[];
@@ -19,7 +20,7 @@ export class MailService {
 
   constructor(config: ConfigService) {
     this.key = config.get<string>('RESEND_API_KEY');
-    this.from = config.get<string>('MAIL_FROM') ?? 'Nara Studio <onboarding@resend.dev>';
+    this.from = config.get<string>('MAIL_FROM') ?? `${brand().name} <onboarding@resend.dev>`;
   }
 
   async send(mail: Mail): Promise<void> {
