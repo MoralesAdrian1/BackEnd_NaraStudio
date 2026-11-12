@@ -18,6 +18,7 @@ import { assertTeaches, ATTENDANCE_OPENS_MS, BookingsService } from '../bookings
 import { consuming, payDeadline } from '../bookings/rules.js';
 import { PurchaseMails } from './purchase-mails.js';
 import { splitAmount } from './split.js';
+import { CHECKOUT_MINUTES, StripeService, type CardPayment } from '../payments/stripe.service.js';
 
 const DAY_MS = 86_400_000;
 /** Reservas que gastan crédito */
@@ -45,6 +46,7 @@ export class MembershipsService {
     private readonly settings: SettingsService,
     private readonly bookings: BookingsService,
     private readonly mails: PurchaseMails,
+    private readonly stripe: StripeService,
   ) {}
 
   /** Presenta membresías contando créditos según la política de faltas. */
@@ -110,10 +112,153 @@ export class MembershipsService {
     return (await this.view())(await this.prisma.membership.findUniqueOrThrow({ where: { id }, include: MEMBERSHIP_INCLUDE }));
   }
 
-  /** La alumna retira su solicitud pendiente. */
+  /**
+   * La alumna paga con tarjeta: se crea la membresía esperando el pago (la clase individual aparta
+   * su lugar mientras tanto) y se manda a la página de pago de Stripe. Se activa con el webhook.
+   */
+  async requestCard(user: AuthUser, dto: CashRequestDto) {
+    const studentId = this.studentIdOf(user);
+    if (!this.stripe.enabled) throw new BadRequestException('El pago con tarjeta no está disponible por ahora');
+    const { plan, session } = await this.checkPurchase(dto);
+
+    // Un intento anterior sin terminar del mismo plan se cierra: así no aparta dos lugares
+    const previous = await this.prisma.membership.findMany({
+      where: { studentId, planId: plan.id, status: 'awaiting_card', classSessionId: dto.classSessionId ?? null },
+    });
+    for (const p of previous) await this.cancelCard(p.id);
+
+    // La sesión de pago vence en 30 min; la solicitud un poco después, por si el aviso de Stripe tarda
+    const holdUntil = new Date(Date.now() + (CHECKOUT_MINUTES + 30) * 60_000);
+    let id: number;
+    if (session) {
+      const refundNoShow = await this.settings.get('refund_credit_on_no_show', true);
+      id = await this.prisma.$transaction(
+        async (tx) => {
+          const locked = await this.bookings.lockSession(tx, session.id);
+          if (locked.status !== 'scheduled' || locked.startsAt <= new Date()) {
+            throw new BadRequestException('Esa clase ya no está disponible');
+          }
+          const m = await tx.membership.create({
+            data: { ...snapshot(plan, session.id), studentId, status: 'awaiting_card', requestExpiresAt: holdUntil },
+          });
+          await this.bookings.reserve(tx, locked, studentId, refundNoShow, 'booked', null, m.id);
+          return m.id;
+        },
+        { timeout: 20_000 },
+      );
+    } else {
+      const m = await this.prisma.membership.create({
+        data: { ...snapshot(plan), studentId, status: 'awaiting_card', requestExpiresAt: holdUntil },
+      });
+      id = m.id;
+    }
+
+    try {
+      const checkout = await this.stripe.checkout({
+        membershipId: id,
+        planName: plan.name,
+        description: session ? `Clase del ${studioDate(session.startsAt)}` : plan.description ?? undefined,
+        amountCents: plan.priceCents,
+        currency: plan.currency,
+        customerId: await this.stripeCustomer(studentId),
+      });
+      await this.prisma.membership.update({ where: { id }, data: { stripeCheckoutId: checkout.id } });
+      return { url: checkout.url };
+    } catch (e) {
+      // Stripe no respondió: no se queda el lugar apartado
+      await this.cancelPending(id);
+      this.logger.error('No se pudo crear la página de pago de Stripe', e);
+      throw new BadRequestException('No se pudo abrir el pago con tarjeta. Intenta de nuevo o paga en efectivo.');
+    }
+  }
+
+  /** Cliente de Stripe de la alumna (se crea la primera vez que paga con tarjeta). */
+  private async stripeCustomer(studentId: number) {
+    const s = await this.prisma.student.findUniqueOrThrow({
+      where: { id: studentId },
+      select: { fullName: true, email: true, phone: true, stripeCustomerId: true, profile: { select: { email: true } } },
+    });
+    if (s.stripeCustomerId) return s.stripeCustomerId;
+    const customer = await this.stripe.stripe.customers.create({
+      name: s.fullName,
+      email: s.profile?.email ?? s.email ?? undefined,
+      phone: s.phone ?? undefined,
+      metadata: { studentId: String(studentId) },
+    });
+    await this.prisma.student.update({ where: { id: studentId }, data: { stripeCustomerId: customer.id } });
+    return customer.id;
+  }
+
+  /**
+   * Ya la apartó en efectivo y prefiere pagar con tarjeta: se abre la página de pago sin soltar su
+   * lugar. Si no termina, sigue apartada en efectivo como estaba.
+   */
+  async payPendingWithCard(user: AuthUser, id: number) {
+    const m = await this.prisma.membership.findUnique({
+      where: { id },
+      include: { plan: true, classSession: true },
+    });
+    if (!m) throw new NotFoundException('La membresía no existe');
+    if (m.studentId !== this.studentIdOf(user)) throw new ForbiddenException();
+    if (!this.stripe.enabled) throw new BadRequestException('El pago con tarjeta no está disponible por ahora');
+    if (m.status !== 'pending_payment' || (m.requestExpiresAt && m.requestExpiresAt <= new Date())) {
+      throw new BadRequestException('Esta solicitud ya no está pendiente de pago');
+    }
+    if (m.stripeCheckoutId) await this.stripe.expireCheckout(m.stripeCheckoutId); // un intento anterior
+    const checkout = await this.stripe.checkout({
+      membershipId: m.id,
+      planName: m.plan.name,
+      description: m.classSession ? `Clase del ${studioDate(m.classSession.startsAt)}` : m.plan.description ?? undefined,
+      amountCents: m.pricePaidCents,
+      currency: m.currency,
+      customerId: await this.stripeCustomer(m.studentId),
+    });
+    await this.prisma.membership.update({ where: { id }, data: { stripeCheckoutId: checkout.id } });
+    return { url: checkout.url };
+  }
+
+  /**
+   * Antes de cobrar en efectivo una solicitud con un pago con tarjeta abierto: si ya lo pagó, no se
+   * cobra dos veces; si no, se cierra esa página de pago.
+   */
+  private async closeOpenCheckout(m: { id: number; stripeCheckoutId: string | null }) {
+    if (!m.stripeCheckoutId || !this.stripe.enabled) return;
+    const s = await this.stripe.stripe.checkout.sessions.retrieve(m.stripeCheckoutId);
+    if (s.status === 'complete') throw new BadRequestException('Ya lo pagó con tarjeta; recarga la lista');
+    if (s.status === 'open') await this.stripe.expireCheckout(s.id);
+    await this.prisma.membership.update({ where: { id: m.id }, data: { stripeCheckoutId: null } });
+  }
+
+  /**
+   * La página de pago venció o se cerró sin pagar. Si se compró con tarjeta, se cancela y se libera
+   * el lugar; si estaba apartada en efectivo, sigue así.
+   */
+  async cancelCard(id: number, checkoutId?: string) {
+    const m = await this.prisma.membership.findUnique({ where: { id } });
+    if (m?.status === 'pending_payment' && checkoutId && m.stripeCheckoutId === checkoutId) {
+      await this.prisma.membership.updateMany({ where: { id, stripeCheckoutId: checkoutId }, data: { stripeCheckoutId: null } });
+      return;
+    }
+    if (m?.status !== 'awaiting_card') return;
+    if (m.stripeCheckoutId) await this.stripe.expireCheckout(m.stripeCheckoutId);
+    // Se vuelve a revisar: el pago pudo entrar mientras se cerraba la página
+    const fresh = await this.prisma.membership.updateMany({ where: { id, status: 'awaiting_card' }, data: { status: 'cancelled' } });
+    if (fresh.count) {
+      await this.prisma.booking.updateMany({
+        where: { membershipId: id, status: 'booked' },
+        data: { status: 'cancelled_by_studio', cancelledAt: new Date() },
+      });
+    }
+  }
+
+  /** La alumna retira su solicitud pendiente (efectivo) o el pago con tarjeta que no terminó. */
   async cancelRequest(user: AuthUser, id: number) {
     const m = await this.find(id);
     if (m.studentId !== this.studentIdOf(user)) throw new ForbiddenException();
+    if (m.status === 'awaiting_card') {
+      await this.cancelCard(id);
+      return (await this.view())(await this.prisma.membership.findUniqueOrThrow({ where: { id }, include: MEMBERSHIP_INCLUDE }));
+    }
     if (m.status !== 'pending_payment') throw new BadRequestException('Solo se pueden retirar solicitudes pendientes');
     return this.cancelPending(id);
   }
@@ -152,6 +297,7 @@ export class MembershipsService {
     if (m.requestExpiresAt && m.requestExpiresAt <= new Date()) {
       throw new BadRequestException('La solicitud venció; la alumna debe pedirla de nuevo');
     }
+    await this.closeOpenCheckout(m);
     return this.activateWithCash(user, m.id);
   }
 
@@ -173,12 +319,14 @@ export class MembershipsService {
     });
     if (!b) throw new NotFoundException('Esa reserva no existe');
     assertTeaches(user, b.session);
+    if (b.membership.status === 'awaiting_card') throw new BadRequestException('Está pagando con tarjeta; espera a que se confirme');
     if (b.membership.status !== 'pending_payment') throw new BadRequestException('Esta reserva ya está pagada');
     if (b.status !== 'booked' && b.status !== 'attended') throw new BadRequestException('Esa reserva está cancelada');
     if (b.session.status === 'cancelled') throw new BadRequestException('La sesión está cancelada');
     if (Date.now() < b.session.startsAt.getTime() - ATTENDANCE_OPENS_MS) {
       throw new BadRequestException('La lista se pasa a partir de 2 horas antes de la clase');
     }
+    await this.closeOpenCheckout(b.membership);
     return this.activateWithCash(user, b.membershipId, { attendBookingId: b.id });
   }
 
@@ -239,9 +387,26 @@ export class MembershipsService {
   private async activateWithCash(
     user: AuthUser,
     id: number,
-    { attendBookingId, atSessionId }: { attendBookingId?: number; atSessionId?: number } = {},
+    opts: { attendBookingId?: number; atSessionId?: number } = {},
   ) {
     const coachId = coachIdOf(user);
+    return this.activate(id, { method: 'cash', coachId }, opts);
+  }
+
+  /**
+   * Stripe confirmó el pago con tarjeta (webhook): se activa la membresía y se registra el pago.
+   * El reparto entre coaches se hace sobre lo neto, ya sin la comisión de Stripe.
+   */
+  activateWithCard(id: number, checkoutId: string, card: CardPayment) {
+    return this.activate(id, { method: 'card', coachId: null, checkoutId, card });
+  }
+
+  private async activate(
+    id: number,
+    pay: { method: 'cash'; coachId: number } | { method: 'card'; coachId: null; checkoutId: string; card: CardPayment },
+    { attendBookingId, atSessionId }: { attendBookingId?: number; atSessionId?: number } = {},
+  ) {
+    const coachId = pay.coachId;
     const now = new Date();
     const refundNoShow = await this.settings.get('refund_credit_on_no_show', true);
 
@@ -261,7 +426,13 @@ export class MembershipsService {
           bookings: { where: { status: { in: [...OCCUPYING] } }, include: { session: true } },
         },
       });
-      if (m.status !== 'pending_payment') throw new BadRequestException('Esta solicitud ya no está pendiente');
+      // En efectivo, la solicitud pendiente; con tarjeta, la de esa página de pago (comprada con
+      // tarjeta, o apartada en efectivo y pagada después con tarjeta)
+      const ok =
+        pay.method === 'cash'
+          ? m.status === 'pending_payment'
+          : (m.status === 'awaiting_card' || m.status === 'pending_payment') && m.stripeCheckoutId === pay.checkoutId;
+      if (!ok) throw new BadRequestException('Esta solicitud ya no está pendiente');
       // Si ya está en la clase de su ficha, la vigencia cuenta desde esa clase
       const first = m.bookings[0]?.session.startsAt ?? atSession?.startsAt;
       const startsAt = first && first < now ? first : now;
@@ -287,17 +458,25 @@ export class MembershipsService {
         await this.bookings.reserve(tx, session, m.studentId, refundNoShow, 'booked', null);
       }
 
-      const allocations = splitAmount(m.pricePaidCents, m.plan.revenueShares);
+      const amounts =
+        pay.method === 'cash'
+          ? { grossCents: m.pricePaidCents, netCents: m.pricePaidCents, receivedById: coachId }
+          : {
+              grossCents: pay.card.grossCents,
+              feeCents: pay.card.feeCents,
+              netCents: pay.card.netCents,
+              stripePaymentIntentId: pay.card.paymentIntentId,
+              stripeChargeId: pay.card.chargeId,
+            };
+      const allocations = splitAmount(amounts.netCents, m.plan.revenueShares);
       await tx.payment.create({
         data: {
           studentId: m.studentId,
           membershipId: m.id,
-          method: 'cash',
+          method: pay.method,
           status: 'succeeded',
-          grossCents: m.pricePaidCents,
-          netCents: m.pricePaidCents,
+          ...amounts,
           currency: m.currency,
-          receivedById: coachId,
           paidAt: now,
           allocations: {
             create: allocations.map((a) => ({
@@ -311,7 +490,7 @@ export class MembershipsService {
       });
     });
 
-    this.mails.paid(id, coachId);
+    this.mails.paid(id, coachId ?? undefined);
     return (await this.view())(await this.prisma.membership.findUniqueOrThrow({ where: { id }, include: MEMBERSHIP_INCLUDE }));
   }
 
@@ -327,7 +506,7 @@ export class MembershipsService {
       const ids = (
         await tx.$queryRaw<{ id: number }[]>`
           SELECT id FROM memberships
-          WHERE status = 'pending_payment' AND request_expires_at <= ${now}
+          WHERE status IN ('pending_payment', 'awaiting_card') AND request_expires_at <= ${now}
           FOR UPDATE SKIP LOCKED`
       ).map((r) => r.id);
       if (ids.length) {

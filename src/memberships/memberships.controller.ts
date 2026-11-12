@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Param, ParseIntPipe, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, ParseIntPipe, Post, Query } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import type { AuthUser } from '../auth/auth-user.js';
 import { CurrentUser, Roles } from '../auth/decorators.js';
 import { PrismaService } from '../prisma/prisma.service.js';
@@ -20,9 +21,26 @@ export class MembershipsController {
 
   /** Comprar con pago en efectivo: queda pendiente unos días hasta que la coach lo confirme. */
   @Roles('student')
+  @Throttle({ default: { ttl: 60_000, limit: 10 } })
   @Post('cash-request')
   requestCash(@CurrentUser() user: AuthUser, @Body() dto: CashRequestDto) {
     return this.memberships.requestCash(user, dto);
+  }
+
+  /** Comprar con tarjeta: devuelve la página de pago de Stripe. */
+  @Roles('student')
+  @Throttle({ default: { ttl: 60_000, limit: 10 } })
+  @Post('card-checkout')
+  requestCard(@CurrentUser() user: AuthUser, @Body() dto: CashRequestDto) {
+    return this.memberships.requestCard(user, dto);
+  }
+
+  /** Pagar con tarjeta lo que ya apartó en efectivo. */
+  @Roles('student')
+  @Throttle({ default: { ttl: 60_000, limit: 10 } })
+  @Post(':id/card-checkout')
+  payPendingWithCard(@CurrentUser() user: AuthUser, @Param('id', ParseIntPipe) id: number) {
+    return this.memberships.payPendingWithCard(user, id);
   }
 
   @Roles('student')
@@ -93,6 +111,7 @@ export class StudentsController {
   }
 
   @Roles('coach')
+  @Throttle({ default: { ttl: 60_000, limit: 20 } })
   @Post()
   create(@CurrentUser() user: AuthUser, @Body() dto: CreateStudentDto) {
     return this.students.create(user, dto);
@@ -100,6 +119,7 @@ export class StudentsController {
 
   /** Carga masiva desde el Excel de alumnas */
   @Roles('admin')
+  @Throttle({ default: { ttl: 60_000, limit: 5 } })
   @Post('import')
   importMany(@CurrentUser() user: AuthUser, @Body() dto: ImportStudentsDto) {
     return this.students.importMany(user, dto);
@@ -107,6 +127,7 @@ export class StudentsController {
 
   /** Vuelve a mandar la invitación (o crea la cuenta a una alumna registrada sin ella). */
   @Roles('coach')
+  @Throttle({ default: { ttl: 60_000, limit: 10 } })
   @Post(':id/invite')
   invite(@CurrentUser() user: AuthUser, @Param('id', ParseIntPipe) id: number) {
     return this.students.invite(user, id);
@@ -116,6 +137,14 @@ export class StudentsController {
   @Get(':id')
   detail(@CurrentUser() user: AuthUser, @Param('id', ParseIntPipe) id: number) {
     return this.students.detail(user, id);
+  }
+
+  /** Borra la cuenta de la alumna y sus datos personales; sus pagos quedan anónimos. */
+  @Roles('admin')
+  @Throttle({ default: { ttl: 60_000, limit: 10 } })
+  @Delete(':id')
+  remove(@Param('id', ParseIntPipe) id: number) {
+    return this.students.remove(id);
   }
 
   @Roles('coach')

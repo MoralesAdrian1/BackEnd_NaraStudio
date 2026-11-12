@@ -67,10 +67,24 @@ export class CreateStudentDto {
   @IsISO8601({ strict: true })
   birthDate?: string;
 
+  // Si es menor de edad: su madre, padre o tutor, que autoriza en persona ante la coach
   @IsOptional()
   @IsString()
-  @MaxLength(300)
-  address?: string;
+  @Length(2, 120)
+  guardianName?: string;
+
+  @IsOptional()
+  @IsString()
+  @Length(8, 20)
+  guardianPhone?: string;
+
+  @IsOptional()
+  @IsEmail({}, { message: 'El correo del tutor no es válido' })
+  guardianEmail?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  guardianConsent?: boolean;
 }
 
 /** Una fila del Excel de carga masiva. El celular y el correo son opcionales: hay alumnas sin uno. */

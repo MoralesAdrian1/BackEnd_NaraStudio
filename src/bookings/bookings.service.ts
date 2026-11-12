@@ -11,6 +11,8 @@ import { coachIdOf, isAdmin } from '../auth/permissions.js';
 import { STUDIO_TZ, studioDate, studioDateTime, addDays } from '../common/studio-time.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { SettingsService } from '../settings/settings.service.js';
+import { readHealth } from '../common/health-crypto.js';
+import { StudentPhotos } from '../common/student-photos.js';
 import {
   bookableUntil,
   consuming,
@@ -37,6 +39,7 @@ export class BookingsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly settings: SettingsService,
+    private readonly photos: StudentPhotos,
   ) {}
 
   private policy() {
@@ -183,7 +186,14 @@ export class BookingsService {
         bookings: {
           include: {
             student: {
-              select: { id: true, fullName: true, phone: true, profileId: true, photoPath: true, health: { select: { specialConditions: true } } },
+              select: {
+                id: true,
+                fullName: true,
+                phone: true,
+                profileId: true,
+                photoPath: true,
+                health: { select: { dataEnc: true, weightKg: true, heightCm: true, specialConditions: true } },
+              },
             },
             membership: { select: { id: true, status: true, pricePaidCents: true, plan: { select: { name: true, kind: true } } } },
           },
@@ -194,11 +204,14 @@ export class BookingsService {
     if (!session) throw new NotFoundException('La sesión no existe');
     assertTeaches(user, session);
     const booked = session.bookings.filter((b) => OCCUPYING.includes(b.status)).length;
-    const salePlans = await this.prisma.plan.findMany({
-      where: { isActive: true, revenueShares: { some: { disciplineId: session.class.disciplineId } } },
-      select: { id: true, name: true, kind: true, credits: true, priceCents: true },
-      orderBy: [{ priceCents: 'asc' }, { id: 'asc' }],
-    });
+    const [salePlans, urls] = await Promise.all([
+      this.prisma.plan.findMany({
+        where: { isActive: true, revenueShares: { some: { disciplineId: session.class.disciplineId } } },
+        select: { id: true, name: true, kind: true, credits: true, priceCents: true },
+        orderBy: [{ priceCents: 'asc' }, { id: 'asc' }],
+      }),
+      this.photos.sign(session.bookings.map((b) => b.student.photoPath)),
+    ]);
     return {
       id: session.id,
       className: session.class.name,
@@ -217,8 +230,8 @@ export class BookingsService {
           fullName: b.student.fullName,
           phone: b.student.phone,
           usesApp: b.student.profileId !== null,
-          photoPath: b.student.photoPath,
-          specialConditions: b.student.health?.specialConditions ?? null,
+          photoUrl: b.student.photoPath ? (urls.get(b.student.photoPath) ?? null) : null,
+          specialConditions: b.student.health ? readHealth(b.student.health).specialConditions : null,
         },
         planName: b.membership.plan.name,
         // Paga en efectivo al llegar: qué se cobra y cuánto
@@ -247,7 +260,7 @@ export class BookingsService {
     const rows = await this.prisma.membership.findMany({
       where: {
         OR: [{ status: 'active' }, { status: 'pending_payment', requestExpiresAt: { gt: new Date() } }],
-        student: { isActive: true },
+        student: { isActive: true, deletedAt: null },
         plan: { revenueShares: { some: { disciplineId: session.class.disciplineId } } },
         AND: [{ OR: [{ classSessionId: null }, { classSessionId: session.id }] }],
       },
@@ -259,6 +272,7 @@ export class BookingsService {
     });
     const target = { id: session.id, startsAt: session.startsAt, disciplineId: session.class.disciplineId };
     type Candidate = { id: number; fullName: string; phone: string | null; usesApp: boolean; photoPath: string | null; planName: string; paysToday: boolean };
+    const urls = await this.photos.sign(rows.map((m) => m.student.photoPath));
     const byStudent = new Map<number, Candidate>();
     // Primero las pagadas: si tiene las dos, se usa la pagada
     rows.sort((a, b) => Number(a.status !== 'active') - Number(b.status !== 'active'));
@@ -288,7 +302,9 @@ export class BookingsService {
         paysToday: m.status === 'pending_payment',
       });
     }
-    return [...byStudent.values()].sort((a, b) => a.fullName.localeCompare(b.fullName, 'es'));
+    return [...byStudent.values()]
+      .map(({ photoPath, ...c }) => ({ ...c, photoUrl: photoPath ? (urls.get(photoPath) ?? null) : null }))
+      .sort((a, b) => a.fullName.localeCompare(b.fullName, 'es'));
   }
 
   /** Pasar lista: asistió, faltó o volver a "reservada". */
@@ -340,6 +356,7 @@ export class BookingsService {
   /**
    * Aparta el lugar y elige la membresía. Bloquea la sesión y las membresías de la alumna
    * para que dos reservas simultáneas no pasen el cupo ni gasten el mismo crédito.
+   * Con forMembershipId usa esa membresía sin buscar otra (clase comprada con tarjeta, mientras paga).
    */
   async reserve(
     tx: Tx,
@@ -348,6 +365,7 @@ export class BookingsService {
     refundNoShow: boolean,
     status: 'booked' | 'attended',
     markedById: number | null,
+    forMembershipId?: number,
   ) {
     const existing = await tx.booking.findUnique({ where: { sessionId_studentId: { sessionId: session.id, studentId } } });
     // La alumna reserva ('booked'); la coach agrega a quien llegó ('attended')
@@ -360,8 +378,13 @@ export class BookingsService {
     if (taken >= session.capacity) throw new ConflictException('La clase está llena');
 
     await tx.$queryRaw`SELECT id FROM memberships WHERE student_id = ${studentId} AND status IN ('active', 'pending_payment') FOR UPDATE`;
-    const memberships = await this.membershipsFor(tx, studentId, refundNoShow);
-    const membership = pickMembership(memberships, { id: session.id, startsAt: session.startsAt, disciplineId: session.disciplineId });
+    const membership = forMembershipId
+      ? { id: forMembershipId, status: 'awaiting_card' as const }
+      : pickMembership(await this.membershipsFor(tx, studentId, refundNoShow), {
+          id: session.id,
+          startsAt: session.startsAt,
+          disciplineId: session.disciplineId,
+        });
     if (!membership) {
       throw new BadRequestException(
         self

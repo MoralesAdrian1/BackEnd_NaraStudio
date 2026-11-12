@@ -16,6 +16,7 @@ import { ProgressModule } from './progress/progress.module.js';
 import { PrismaModule } from './prisma/prisma.module.js';
 import { SettingsModule } from './settings/settings.module.js';
 import { SettlementsModule } from './settlements/settlements.module.js';
+import { StudentPhotosModule } from './common/student-photos.js';
 
 @Module({
   imports: [
@@ -23,6 +24,7 @@ import { SettlementsModule } from './settlements/settlements.module.js';
     ScheduleModule.forRoot(),
     PrismaModule,
     SettingsModule,
+    StudentPhotosModule,
     MailModule,
     AuthModule,
     MeModule,

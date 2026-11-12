@@ -8,6 +8,10 @@ import { invitation } from '../mail/templates.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { studioDate, studioDateTime } from '../common/studio-time.js';
 import type { CreateStudentDto, ImportStudentsDto } from './memberships.dto.js';
+import { assertAllowedAge, isMinor } from '../common/age.js';
+import { readHealth } from '../common/health-crypto.js';
+import { StudentPhotos } from '../common/student-photos.js';
+import { AccountDeletion } from '../me/account-deletion.service.js';
 
 // Resend acepta 2 correos por segundo
 const MAIL_GAP_MS = 600;
@@ -21,6 +25,8 @@ export class StudentsService {
     private readonly prisma: PrismaService,
     private readonly admin: SupabaseAdmin,
     private readonly mail: MailService,
+    private readonly photos: StudentPhotos,
+    private readonly deletion: AccountDeletion,
   ) {}
 
   /**
@@ -49,7 +55,7 @@ export class StudentsService {
         }
       : {};
     const rows = await this.prisma.student.findMany({
-      where: { AND: [this.visibleTo(user), search, { isActive: true }] },
+      where: { AND: [this.visibleTo(user), search, { isActive: true, deletedAt: null }] },
       include: {
         memberships: {
           where: { status: 'active', expiresAt: { gt: new Date() } },
@@ -59,12 +65,13 @@ export class StudentsService {
       orderBy: { fullName: 'asc' },
       take: 200,
     });
+    const urls = await this.photos.sign(rows.map((s) => s.photoPath));
     return rows.map((s) => ({
       id: s.id,
       fullName: s.fullName,
       phone: s.phone,
       email: s.email,
-      photoPath: s.photoPath,
+      photoUrl: s.photoPath ? (urls.get(s.photoPath) ?? null) : null,
       usesApp: s.profileId !== null,
       activePlans: s.memberships.map((m) => m.plan.name),
     }));
@@ -72,21 +79,25 @@ export class StudentsService {
 
   async detail(user: AuthUser, id: number) {
     const s = await this.prisma.student.findFirst({
-      where: { AND: [{ id }, this.visibleTo(user)] },
+      where: { AND: [{ id }, { deletedAt: null }, this.visibleTo(user)] },
       include: { health: true },
     });
     if (!s) throw new NotFoundException('La alumna no existe o no es de tus disciplinas');
+    const [urls, hasSignedIn] = await Promise.all([this.photos.sign([s.photoPath]), this.hasSignedIn(s.profileId)]);
     return {
       id: s.id,
       fullName: s.fullName,
       phone: s.phone,
       email: s.email,
-      address: s.address,
       birthDate: s.birthDate,
-      photoPath: s.photoPath,
+      isMinor: isMinor(s.birthDate),
+      guardian: s.guardianConsentAt
+        ? { name: s.guardianName, phone: s.guardianPhone, email: s.guardianEmail, consentAt: s.guardianConsentAt }
+        : null,
+      photoUrl: s.photoPath ? (urls.get(s.photoPath) ?? null) : null,
       usesApp: s.profileId !== null,
-      hasSignedIn: await this.hasSignedIn(s.profileId),
-      health: s.health,
+      hasSignedIn,
+      health: s.health && { ...readHealth(s.health), consentAt: s.health.consentAt, updatedAt: s.health.updatedAt },
     };
   }
 
@@ -100,6 +111,14 @@ export class StudentsService {
     if (await this.prisma.profile.findUnique({ where: { email } })) {
       throw new ConflictException('Ya hay una cuenta con ese correo. Búscala en tu lista o pídele que compre su plan desde la app.');
     }
+    if (dto.birthDate) assertAllowedAge(dto.birthDate);
+    const minor = isMinor(dto.birthDate);
+    if (minor && (!dto.guardianName || !dto.guardianPhone || !dto.guardianConsent)) {
+      throw new BadRequestException('Es menor de edad: escribe el nombre y el celular de su madre, padre o tutor y confirma su autorización');
+    }
+    const guardian = minor
+      ? { guardianName: dto.guardianName, guardianPhone: dto.guardianPhone, guardianEmail: dto.guardianEmail, guardianConsentAt: new Date() }
+      : {};
     const account = await this.admin.createUser(email, dto.fullName);
     const birthDate = dto.birthDate ? new Date(dto.birthDate) : undefined;
     let student;
@@ -113,7 +132,7 @@ export class StudentsService {
           phone: dto.phone,
           birthDate,
           student: {
-            create: { fullName: dto.fullName, email, phone: dto.phone, address: dto.address, birthDate, registeredById: coachId },
+            create: { fullName: dto.fullName, email, phone: dto.phone, birthDate, registeredById: coachId, ...guardian },
           },
         },
         include: { student: true },
@@ -286,6 +305,11 @@ export class StudentsService {
     } catch {
       return null; // sin acceso al esquema auth: no se sabe
     }
+  }
+
+  /** La admin borra la cuenta de una alumna y sus datos personales (a petición de la alumna). */
+  async remove(id: number) {
+    return this.deletion.deleteStudent(id);
   }
 
   /** Para ver el detalle de una alumna hay que poder administrarla. */

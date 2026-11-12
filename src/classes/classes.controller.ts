@@ -1,4 +1,15 @@
-import { Body, Controller, Delete, Get, Param, ParseIntPipe, Patch, Post, Query } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  ParseIntPipe,
+  Patch,
+  Post,
+  Query,
+} from '@nestjs/common';
 import type { AuthUser } from '../auth/auth-user.js';
 import { CurrentUser, Public, Roles } from '../auth/decorators.js';
 import {
@@ -38,13 +49,21 @@ export class ClassesController {
 
   @Roles('coach')
   @Patch(':id')
-  update(@CurrentUser() user: AuthUser, @Param('id', ParseIntPipe) id: number, @Body() dto: UpdateClassDto) {
+  update(
+    @CurrentUser() user: AuthUser,
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: UpdateClassDto,
+  ) {
     return this.classes.update(user, id, dto);
   }
 
   @Roles('coach')
   @Post(':id/schedules')
-  addSchedule(@CurrentUser() user: AuthUser, @Param('id', ParseIntPipe) id: number, @Body() dto: CreateScheduleDto) {
+  addSchedule(
+    @CurrentUser() user: AuthUser,
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: CreateScheduleDto,
+  ) {
     return this.classes.addSchedule(user, id, dto);
   }
 
@@ -78,7 +97,11 @@ export class SessionsController {
 
   @Roles('coach')
   @Post(':id/cancel')
-  cancel(@CurrentUser() user: AuthUser, @Param('id', ParseIntPipe) id: number, @Body() dto: CancelSessionDto) {
+  cancel(
+    @CurrentUser() user: AuthUser,
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: CancelSessionDto,
+  ) {
     return this.sessions.cancel(user, id, dto.reason);
   }
 
@@ -109,6 +132,8 @@ export class ClosuresController {
   @Roles('admin')
   @Delete(':date')
   remove(@Param('date') date: string) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(date)))
+      throw new BadRequestException('Fecha inválida');
     return this.sessions.deleteClosure(date);
   }
 }

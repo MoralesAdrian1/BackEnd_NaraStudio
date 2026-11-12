@@ -2,8 +2,12 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import type { AuthUser } from '../auth/auth-user.js';
-import type { UpdateHealthDto, UpdateMeDto } from './me.dto.js';
+import type { DeleteMeDto, UpdateHealthDto, UpdateMeDto } from './me.dto.js';
 import { TERMS_VERSION } from '../common/legal.js';
+import { assertAllowedAge, isMinor } from '../common/age.js';
+import { readHealth, sealHealth } from '../common/health-crypto.js';
+import { StudentPhotos } from '../common/student-photos.js';
+import { AccountDeletion } from './account-deletion.service.js';
 
 const ME_INCLUDE = {
   student: { include: { health: true } },
@@ -14,7 +18,11 @@ type Me = Prisma.ProfileGetPayload<{ include: typeof ME_INCLUDE }>;
 
 @Injectable()
 export class MeService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly photos: StudentPhotos,
+    private readonly deletion: AccountDeletion,
+  ) {}
 
   /** Devuelve el perfil; en el primer ingreso lo crea como alumna. */
   async getOrCreate(user: AuthUser) {
@@ -24,7 +32,7 @@ export class MeService {
     const email = user.claims.email;
     if (!email) throw new BadRequestException('La cuenta no tiene correo');
     const meta = user.claims.user_metadata;
-    const fullName = meta?.full_name ?? meta?.name ?? email.split('@')[0];
+    const fullName = (meta?.full_name ?? meta?.name ?? email.split('@')[0]).slice(0, 120);
     // Al crear la cuenta con correo ya aceptó los documentos (viene en sus metadatos)
     const accepted = meta?.terms_version === TERMS_VERSION;
 
@@ -51,7 +59,12 @@ export class MeService {
     if (dto.photoPath && !dto.photoPath.startsWith(`${user.id}/`)) {
       throw new BadRequestException('La foto debe estar en tu carpeta');
     }
+    if (dto.birthDate) assertAllowedAge(dto.birthDate);
     const birthDate = dto.birthDate ? new Date(dto.birthDate) : undefined;
+
+    // Menor de edad: hace falta su madre, padre o tutor (una vez; después solo se actualizan)
+    const minor = me.student && isMinor(dto.birthDate ?? me.birthDate);
+    const guardian = minor ? this.guardianData(me, dto) : {};
 
     await this.prisma.$transaction(async (tx) => {
       await tx.profile.update({
@@ -70,9 +83,9 @@ export class MeService {
             fullName: dto.fullName,
             phone: dto.phone,
             birthDate,
-            address: dto.address,
             publicName: dto.publicName,
             photoPath: dto.photoPath,
+            ...guardian,
           },
         });
       }
@@ -80,14 +93,35 @@ export class MeService {
     return this.present((await this.find(user.id))!);
   }
 
+  /** Datos del tutor que se guardan. Pide los que falten si todavía no autorizó. */
+  private guardianData(me: Me, dto: UpdateMeDto) {
+    const s = me.student!;
+    const name = dto.guardianName ?? s.guardianName;
+    const phone = dto.guardianPhone ?? s.guardianPhone;
+    const consented = s.guardianConsentAt || dto.guardianConsent;
+    if (!name || !phone || !consented) {
+      throw new BadRequestException(
+        'Como eres menor de edad, necesitamos el nombre y el celular de tu madre, padre o tutor, y su autorización',
+      );
+    }
+    return {
+      guardianName: dto.guardianName,
+      guardianPhone: dto.guardianPhone,
+      guardianEmail: dto.guardianEmail,
+      ...(!s.guardianConsentAt && { guardianConsentAt: new Date() }),
+    };
+  }
+
   async updateHealth(user: AuthUser, dto: UpdateHealthDto) {
     const me = await this.requireMe(user);
     if (!me.student) throw new BadRequestException('Solo las alumnas registran datos de salud');
 
     const data = {
-      weightKg: dto.weightKg,
-      heightCm: dto.heightCm,
-      specialConditions: dto.specialConditions,
+      ...sealHealth({
+        weightKg: dto.weightKg ?? null,
+        heightCm: dto.heightCm ?? null,
+        specialConditions: dto.specialConditions?.trim() || null,
+      }),
       consentAt: new Date(),
     };
     await this.prisma.studentHealth.upsert({
@@ -96,6 +130,25 @@ export class MeService {
       update: data,
     });
     return this.present((await this.find(user.id))!);
+  }
+
+  /** Revoca el consentimiento: se borran sus datos de salud. */
+  async deleteHealth(user: AuthUser) {
+    const me = await this.requireMe(user);
+    if (me.student) await this.prisma.studentHealth.deleteMany({ where: { studentId: me.student.id } });
+    return this.present((await this.find(user.id))!);
+  }
+
+  /** La alumna borra su cuenta y sus datos personales. */
+  async deleteAccount(user: AuthUser, dto: DeleteMeDto) {
+    const me = await this.requireMe(user);
+    if (!me.student || me.role !== 'student') {
+      throw new BadRequestException('Las cuentas de coach las da de baja la head coach. Escríbele para hacerlo.');
+    }
+    if (dto.confirmEmail.trim().toLowerCase() !== me.email.toLowerCase()) {
+      throw new BadRequestException('El correo no coincide con el de tu cuenta');
+    }
+    return this.deletion.deleteStudent(me.student.id);
   }
 
   private find(id: string) {
@@ -109,15 +162,24 @@ export class MeService {
   }
 
   /** Perfil + qué datos le faltan por completar (para el registro con Google o Facebook). */
-  private present(me: Me) {
+  private async present(me: Me) {
     const missing: string[] = [];
     if (me.termsVersion !== TERMS_VERSION) missing.push('terms');
     if (!me.phone) missing.push('phone');
     if (!me.birthDate) missing.push('birthDate');
+    if (me.student && isMinor(me.birthDate) && !me.student.guardianConsentAt) missing.push('guardian');
+
+    let student = null;
     if (me.student) {
-      if (!me.student.address) missing.push('address');
-      if (!me.student.health?.consentAt) missing.push('health');
+      const { health, ...rest } = me.student;
+      const photoUrl = (await this.photos.sign([rest.photoPath])).get(rest.photoPath ?? '') ?? null;
+      student = {
+        ...rest,
+        photoUrl,
+        isMinor: isMinor(me.birthDate),
+        health: health && { ...readHealth(health), consentAt: health.consentAt, updatedAt: health.updatedAt },
+      };
     }
-    return { ...me, missing, isComplete: missing.length === 0 };
+    return { ...me, student, missing, isComplete: missing.length === 0 };
   }
 }

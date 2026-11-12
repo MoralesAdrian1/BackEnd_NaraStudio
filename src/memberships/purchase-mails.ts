@@ -31,7 +31,7 @@ export class PurchaseMails {
   }
 
   /** Entró el pago: recibo a la alumna y aviso a las coaches del plan (menos a quien cobró). */
-  paid(membershipId: number, receivedById: number) {
+  paid(membershipId: number, receivedById?: number) {
     this.later(async () => {
       const x = await this.load(membershipId, receivedById);
       const payment = await this.prisma.payment.findFirst({

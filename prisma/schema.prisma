@@ -13,6 +13,9 @@ generator client {
   output              = "../src/generated/prisma"
   moduleFormat        = "esm"
   importFileExtension = "js"
+  // Las relaciones (include) se cargan en la misma consulta con JOIN, no una consulta por
+  // relación: con la base en otra región cada viaje cuesta ~70-90 ms
+  previewFeatures     = ["relationJoins"]
 }
 
 datasource db {
@@ -48,6 +51,7 @@ enum PlanKind {
 
 enum MembershipStatus {
   pending_payment // efectivo: se paga el día de la clase (vence en request_expires_at)
+  awaiting_card // en la página de pago de Stripe (vence en request_expires_at si no paga)
   active
   expired
   cancelled
@@ -123,18 +127,18 @@ enum LegalDocumentKind {
 
 /// Una fila por cuenta de Supabase Auth (id = auth.users.id).
 model Profile {
-  id        String    @id @db.Uuid
-  role      Role
-  fullName  String    @map("full_name")
-  email     String    @unique
-  phone     String?
-  birthDate DateTime? @map("birth_date") @db.Date
-  isActive  Boolean   @default(true) @map("is_active")
+  id              String    @id @db.Uuid
+  role            Role
+  fullName        String    @map("full_name")
+  email           String    @unique
+  phone           String?
+  birthDate       DateTime? @map("birth_date") @db.Date
+  isActive        Boolean   @default(true) @map("is_active")
   /// Versión de los términos y el aviso de privacidad que aceptó (ver src/common/legal.ts)
   termsVersion    String?   @map("terms_version")
   termsAcceptedAt DateTime? @map("terms_accepted_at") @db.Timestamptz
-  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz
 
   student Student?
   coach   Coach?
@@ -145,20 +149,26 @@ model Profile {
 /// Alumna. Las que registra una coach reciben una invitación y tienen cuenta desde el inicio;
 /// sin profile_id = registro anterior que todavía no tiene cuenta.
 model Student {
-  id               Int       @id @default(autoincrement())
-  profileId        String?   @unique @map("profile_id") @db.Uuid
-  fullName         String    @map("full_name")
-  publicName       String?   @map("public_name") // nombre en la tabla de reconocimientos
-  email            String?
-  phone            String?
-  address          String?
-  birthDate        DateTime? @map("birth_date") @db.Date
-  photoPath        String?   @map("photo_path") // ruta en Supabase Storage (bucket students)
-  stripeCustomerId String?   @unique @map("stripe_customer_id")
-  registeredById   Int?      @map("registered_by_id")
-  isActive         Boolean   @default(true) @map("is_active")
-  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  id                Int       @id @default(autoincrement())
+  profileId         String?   @unique @map("profile_id") @db.Uuid
+  fullName          String    @map("full_name")
+  publicName        String?   @map("public_name") // nombre en la tabla de reconocimientos
+  email             String?
+  phone             String?
+  birthDate         DateTime? @map("birth_date") @db.Date
+  photoPath         String?   @map("photo_path") // ruta en Supabase Storage (bucket students, privado)
+  /// Menores de 18: madre, padre o tutor que autoriza el registro y el tratamiento de sus datos
+  guardianName      String?   @map("guardian_name")
+  guardianPhone     String?   @map("guardian_phone")
+  guardianEmail     String?   @map("guardian_email")
+  guardianConsentAt DateTime? @map("guardian_consent_at") @db.Timestamptz
+  /// Cuenta eliminada: se borran sus datos personales y solo quedan sus pagos y reservas (ley fiscal)
+  deletedAt         DateTime? @map("deleted_at") @db.Timestamptz
+  stripeCustomerId  String?   @unique @map("stripe_customer_id")
+  registeredById    Int?      @map("registered_by_id")
+  isActive          Boolean   @default(true) @map("is_active")
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt         DateTime  @updatedAt @map("updated_at") @db.Timestamptz
 
   profile          Profile?           @relation(fields: [profileId], references: [id], onDelete: SetNull)
   registeredBy     Coach?             @relation("StudentRegisteredBy", fields: [registeredById], references: [id], onDelete: SetNull)
@@ -174,9 +184,12 @@ model Student {
   @@map("students")
 }
 
-/// Datos sensibles (LFPDPPP): solo los ven la alumna y sus coaches.
+/// Datos sensibles (LFPDPPP): solo los ven la alumna y sus coaches. Se guardan cifrados
+/// (AES-256-GCM, llave HEALTH_DATA_KEY) en data_enc; las columnas sueltas quedan vacías y solo
+/// sirven para leer registros anteriores al cifrado (scripts/encrypt-health.mjs los migra).
 model StudentHealth {
   studentId         Int       @id @map("student_id")
+  dataEnc           String?   @map("data_enc")
   weightKg          Decimal?  @map("weight_kg") @db.Decimal(5, 2)
   heightCm          Int?      @map("height_cm") @db.SmallInt
   specialConditions String?   @map("special_conditions") // lesiones, alergias, etc.
@@ -402,6 +415,7 @@ model Membership {
   autoRenew            Boolean          @default(false) @map("auto_renew")
   cancelAtPeriodEnd    Boolean          @default(false) @map("cancel_at_period_end")
   stripeSubscriptionId String?          @map("stripe_subscription_id")
+  stripeCheckoutId     String?          @unique @map("stripe_checkout_id") // pago con tarjeta (Stripe Checkout)
   renewedFromId        Int?             @unique @map("renewed_from_id")
   requestExpiresAt     DateTime?        @map("request_expires_at") @db.Timestamptz // efectivo: +3 días, o al terminar la clase reservada
   approvedById         Int?             @map("approved_by_id")

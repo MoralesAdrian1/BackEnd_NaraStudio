@@ -49,6 +49,16 @@ export class SupabaseAdmin {
     return `${this.appUrl}/restablecer?${q}`;
   }
 
+  /** Borra la cuenta de acceso (y en cascada su perfil). Falla si Supabase no la borra. */
+  async removeUser(id: string) {
+    if (!this.key) throw new ServiceUnavailableException('Falta SUPABASE_SECRET_KEY en el servidor para borrar cuentas');
+    const res = await fetch(`${this.url}/admin/users/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: { apikey: this.key, authorization: `Bearer ${this.key}` },
+    });
+    if (!res.ok && res.status !== 404) throw new ServiceUnavailableException(`No se pudo borrar la cuenta (Supabase Auth: ${res.status})`);
+  }
+
   /** Si algo falla después de crear la cuenta, se borra para no dejarla huérfana. */
   async deleteUser(id: string) {
     if (!this.key) return;
